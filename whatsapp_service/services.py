@@ -6,6 +6,7 @@ from candidate.models import ConversationLog
 
 
 def send_whatsapp(candidate, message, is_initial=False):
+    """Used for plain text replies (AI responses, final confirmations)."""
     try:
         client = Client(
             settings.TWILIO_ACCOUNT_SID,
@@ -26,7 +27,6 @@ def send_whatsapp(candidate, message, is_initial=False):
             status="success",
         )
 
-        # Log initial outbound message we sent to candidate
         if is_initial:
             ConversationLog.objects.create(
                 candidate=candidate,
