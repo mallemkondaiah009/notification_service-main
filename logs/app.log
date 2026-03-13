@@ -1,0 +1,18 @@
+[2026-03-13 12:42:49,641] INFO call_service — [CALL] AI fallback — candidate=1
+[2026-03-13 12:43:22,994] INFO call_service — [CALL] AI fallback — candidate=1
+[2026-03-13 12:56:40,697] INFO call_service — [CALL] AI fallback — candidate=1 speech='What is the salary?'
+[2026-03-13 12:57:10,534] INFO call_service — [CALL] AI fallback — candidate=1 speech='Yes, I am interested in this page.'
+[2026-03-13 13:17:55,389] INFO call_service — [CALL] AI fallback — candidate=1 speech='What is the salary?'
+[2026-03-13 13:18:27,297] INFO call_service — [CALL] AI fallback — candidate=1 speech='onset'
+[2026-03-13 13:18:50,239] INFO call_service — [CALL] AI fallback — candidate=1 speech='Yes, I am interested.'
+[2026-03-13 13:39:51,357] INFO call_service — [CALL] JD direct hit — field=salary_basic
+[2026-03-13 13:39:51,362] INFO call_service — [CALL] Direct JD hit — candidate=1 field=Basic Salary
+[2026-03-13 13:40:42,125] INFO call_service — [CALL] JD direct hit — field=loc_remote
+[2026-03-13 13:40:42,128] INFO call_service — [CALL] Direct JD hit — candidate=1 field=Remote / Hybrid Policy
+[2026-03-13 13:41:04,936] INFO call_service — [CALL] Direct intent: interested — candidate=1
+[2026-03-13 13:48:20,468] INFO call_service — [CALL] JD direct hit — field=salary_basic
+[2026-03-13 13:48:20,472] INFO call_service — [CALL] Direct JD hit — candidate=1 field=Basic Salary
+[2026-03-13 13:48:57,830] INFO call_service — [CALL] JD direct hit — field=resp_daily
+[2026-03-13 13:48:57,833] INFO call_service — [CALL] Direct JD hit — candidate=1 field=Daily Responsibilities
+[2026-03-13 13:49:44,513] INFO call_service — [CALL] AI fallback — candidate=1 speech='Who are you?'
+[2026-03-13 13:50:05,508] INFO call_service — [CALL] Direct intent: interested — candidate=1

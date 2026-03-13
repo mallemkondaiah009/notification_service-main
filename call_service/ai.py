@@ -30,46 +30,29 @@ Rules:
   STATUS:interested
   STATUS:not_interested
   STATUS:unclear
-
-Example responses:
-
-Candidate says "yes I am interested":
-"Thank you so much for your interest, {candidate_name}! Our recruitment team will reach out to you very soon with the next steps. Have a great day!"
-STATUS:interested
-
-Candidate says "no not right now":
-"Thank you for letting us know, {candidate_name}. We will keep your profile on file for future opportunities. Have a great day!"
-STATUS:not_interested
-
-Candidate says "what is the salary?":
-"[Answer using job description details]. So are you interested in moving forward with this opportunity?"
-STATUS:unclear
-
-Candidate says "maybe" or something unclear:
-"I understand. Could you please confirm — are you interested in the {role_name} position or not?"
-STATUS:unclear
 """
 
 
-def get_ai_response(candidate_speech, candidate_name, role_name, job_description):
+def get_ai_response(candidate_speech, candidate_name, role_name, job_description, history=None):
     system_prompt = build_system_prompt(candidate_name, role_name, job_description)
+
+    messages = [{"role": "system", "content": system_prompt}]
+
+    if history:
+        messages.extend(history)
+
+    messages.append({
+        "role": "user",
+        "content": (
+            f"Candidate name: {candidate_name}\n"
+            f"Role: {role_name}\n"
+            f"Candidate said: {candidate_speech}"
+        ),
+    })
 
     response = client.chat.completions.create(
         model="gpt-4o",
-        messages=[
-            {
-                "role": "system",
-                "content": system_prompt,
-            },
-            {
-                "role": "user",
-                "content": (
-                    f"Candidate name: {candidate_name}\n"
-                    f"Role: {role_name}\n"
-                    f"Candidate said: {candidate_speech}"
-                ),
-            },
-        ],
+        messages=messages,
         max_tokens=300,
         temperature=0.7,
     )
@@ -82,11 +65,9 @@ def get_ai_response(candidate_speech, candidate_name, role_name, job_description
     if "STATUS:interested" in full_response:
         status = "interested"
         speech_response = full_response.replace("STATUS:interested", "").strip()
-
     elif "STATUS:not_interested" in full_response:
         status = "not_interested"
         speech_response = full_response.replace("STATUS:not_interested", "").strip()
-
     elif "STATUS:unclear" in full_response:
         status = "unclear"
         speech_response = full_response.replace("STATUS:unclear", "").strip()

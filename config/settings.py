@@ -158,3 +158,38 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 CSRF_TRUSTED_ORIGINS = [
     "https://armani-suppled-odorously.ngrok-free.dev",
 ]
+
+
+LOGGING = {
+    "version": 1,
+    "disable_existing_loggers": False,
+    "formatters": {
+        "verbose": {
+            "format": "[{asctime}] {levelname} {name} — {message}",
+            "style": "{",
+        },
+    },
+    "handlers": {
+        "console": {
+            "class": "logging.StreamHandler",
+            "formatter": "verbose",
+        },
+        "file": {
+            "class": "logging.FileHandler",
+            "filename": "logs/app.log",
+            "formatter": "verbose",
+        },
+    },
+    "loggers": {
+        "call_service": {
+            "handlers": ["console", "file"],
+            "level": "INFO",
+            "propagate": False,
+        },
+        "whatsapp_service": {
+            "handlers": ["console", "file"],
+            "level": "INFO",
+            "propagate": False,
+        },
+    },
+}
