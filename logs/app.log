@@ -16,3 +16,11 @@
 [2026-03-13 13:48:57,833] INFO call_service — [CALL] Direct JD hit — candidate=1 field=Daily Responsibilities
 [2026-03-13 13:49:44,513] INFO call_service — [CALL] AI fallback — candidate=1 speech='Who are you?'
 [2026-03-13 13:50:05,508] INFO call_service — [CALL] Direct intent: interested — candidate=1
+[2026-03-13 15:25:17,903] INFO call_service — [CALL] JD direct hit — field=notice_duration
+[2026-03-13 15:25:17,908] INFO call_service — [CALL] Direct JD hit — candidate=1 field=Notice Period Duration
+[2026-03-13 15:25:48,528] INFO call_service — [CALL] JD direct hit — field=loc_remote
+[2026-03-13 15:25:48,531] INFO call_service — [CALL] Direct JD hit — candidate=1 field=Remote / Hybrid Policy
+[2026-03-13 15:26:07,195] INFO call_service — [CALL] JD direct hit — field=salary_basic
+[2026-03-13 15:26:07,198] INFO call_service — [CALL] Direct JD hit — candidate=1 field=Basic Salary
+[2026-03-13 15:26:44,846] INFO call_service — [CALL] AI fallback — candidate=1 speech='is there any Bond'
+[2026-03-13 15:27:03,828] INFO call_service — [CALL] Direct intent: interested — candidate=1

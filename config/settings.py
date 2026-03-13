@@ -48,7 +48,7 @@ INSTALLED_APPS = [
     "email_service",
     "whatsapp_service",
     "call_service",
-    "workers",
+    # "workers",
     "delivery_logs",
     "candidate",
 ]
@@ -116,13 +116,15 @@ AUTH_PASSWORD_VALIDATORS = [
 # Internationalization
 # https://docs.djangoproject.com/en/6.0/topics/i18n/
 
-LANGUAGE_CODE = 'en-us'
+ANGUAGE_CODE = 'en-us'
 
 TIME_ZONE = 'UTC'
 
 USE_I18N = True
 
 USE_TZ = True
+
+TIME_ZONE = 'Asia/Kolkata'
 
 
 # Static files (CSS, JavaScript, Images)
