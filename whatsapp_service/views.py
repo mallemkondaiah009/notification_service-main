@@ -15,8 +15,8 @@ from .menus import (
     send_benefits_menu,
     send_interest_buttons,
 )
-from shared.jd_parser import extract_answer, JD_FIELD_KEYWORDS
-from .quick_replies import resolve_intent, set_context, clear_context
+from shared.jd_parser import extract_answer, FRIENDLY_LABELS
+from .quick_replies import resolve_intent, get_context, set_context, clear_context
 
 
 def _log_delivery(candidate, message, status):
@@ -47,6 +47,22 @@ def _log_conversation(candidate, direction, sender, message, ai_detected_status=
     )
 
 
+def _serve_jd_answer(candidate, field: str):
+    """Tier 2 — extract answer from JD and send with interest buttons."""
+    label, answer = extract_answer(field, candidate.job_description)
+    if answer:
+        context_msg = f"*{label}*\n\n{answer}"
+    else:
+        label = FRIENDLY_LABELS.get(field, field.replace("_", " ").title())
+        context_msg = (
+            f"We don't have specific details about *{label}* right now.\n\n"
+            f"Feel free to type your question and our team will get back to you!"
+        )
+    _log_delivery(candidate, f"JD answer served: {label}", "success")
+    _log_conversation(candidate, "outbound", "system", context_msg)
+    send_interest_buttons(candidate, context_msg)
+
+
 @api_view(["POST"])
 def whatsapp_webhook(request):
     phone = request.data.get("From", "").replace("whatsapp:", "")
@@ -64,7 +80,16 @@ def whatsapp_webhook(request):
 
     intent = resolve_intent(candidate.id, message)
 
-    # ── INTERESTED ────────────────────────────────────────────────────
+    # ── Unrecognized input inside a sub-menu → back to main menu ─────
+    if intent is None:
+        current_context = get_context(candidate.id)
+        if current_context != "main":
+            clear_context(candidate.id)
+            _log_conversation(candidate, "outbound", "system", "[Unrecognized in sub-menu → Main Menu]")
+            send_main_menu(candidate)
+            return Response({"status": "received"})
+
+    # ── TIER 1: INTERESTED ────────────────────────────────────────────
     if intent == "interested":
         _save_response(candidate, "interested")
         clear_context(candidate.id)
@@ -77,7 +102,7 @@ def whatsapp_webhook(request):
         _log_conversation(candidate, "outbound", "system", reply, "interested")
         send_whatsapp_reply_message.delay(candidate.id, reply)
 
-    # ── NOT INTERESTED ────────────────────────────────────────────────
+    # ── TIER 1: NOT INTERESTED ────────────────────────────────────────
     elif intent == "not_interested":
         _save_response(candidate, "not_interested")
         clear_context(candidate.id)
@@ -90,13 +115,13 @@ def whatsapp_webhook(request):
         _log_conversation(candidate, "outbound", "system", reply, "not_interested")
         send_whatsapp_reply_message.delay(candidate.id, reply)
 
-    # ── BACK TO MAIN MENU ─────────────────────────────────────────────
+    # ── TIER 1: BACK TO MAIN MENU ─────────────────────────────────────
     elif intent == "back_main":
         clear_context(candidate.id)
         _log_conversation(candidate, "outbound", "system", "[Main Menu Sent]")
         send_main_menu(candidate)
 
-    # ── MAIN MENU CATEGORIES ──────────────────────────────────────────
+    # ── MENU NAVIGATION ───────────────────────────────────────────────
     elif intent == "menu_salary":
         set_context(candidate.id, "salary")
         _log_conversation(candidate, "outbound", "system", "[Salary Sub-Menu Sent]")
@@ -122,7 +147,12 @@ def whatsapp_webhook(request):
         _log_conversation(candidate, "outbound", "system", "[Benefits Sub-Menu Sent]")
         send_benefits_menu(candidate)
 
-    # ── SUB-MENU ITEMS → extract from JD ─────────────────────────────
+    # ── TIER 2: DIRECT JD ANSWER (natural language topic match) ──────
+    elif intent and intent.startswith("jd_"):
+        field = intent[3:]  # strip "jd_" prefix → e.g. "salary_basic"
+        _serve_jd_answer(candidate, field)
+
+    # ── NUMBERED SUB-MENU ITEMS → extract from JD ────────────────────
     elif intent in (
         "salary_basic", "salary_ctc", "salary_variables", "salary_increment",
         "resp_daily", "resp_skills", "resp_team", "resp_growth",
@@ -130,57 +160,29 @@ def whatsapp_webhook(request):
         "notice_duration", "notice_buyout", "notice_immediate",
         "ben_insurance", "ben_leaves", "ben_food", "ben_other",
     ):
-        label, answer = extract_answer(intent, candidate.job_description)
-        if answer:
-            context_msg = f"*{label}*\n\n{answer}"
-        else:
-            context_msg = (
-                f"We don't have specific details about *{label}* right now.\n\n"
-                f"Feel free to type your question and our team will get back to you!"
-            )
-        _log_delivery(candidate, f"JD answer served: {label}", "success")
-        _log_conversation(candidate, "outbound", "system", context_msg)
-        send_interest_buttons(candidate, context_msg)
+        _serve_jd_answer(candidate, intent)
 
-    # ── CUSTOM TEXT → check JD first, then AI ────────────────────────
+    # ── TIER 3: AI FALLBACK ───────────────────────────────────────────
     else:
-        matched_label = None
-        matched_answer = None
+        ai_response, detected_status = get_ai_whatsapp_response(
+            candidate_message=message,
+            candidate_name=candidate.full_name,
+            role_name=candidate.role_name,
+            job_description=candidate.job_description,
+        )
 
-        for button_id, keywords in JD_FIELD_KEYWORDS.items():
-            if any(kw in message.lower() for kw in keywords):
-                label, answer = extract_answer(button_id, candidate.job_description)
-                if answer:
-                    matched_label = label
-                    matched_answer = answer
-                    break
-
-        if matched_answer:
-            context_msg = f"*{matched_label}*\n\n{matched_answer}"
-            _log_delivery(candidate, f"JD answer served (freetext): {matched_label}", "success")
-            _log_conversation(candidate, "outbound", "system", context_msg)
-            send_interest_buttons(candidate, context_msg)
-
+        if detected_status == "interested":
+            _save_response(candidate, "interested")
+            clear_context(candidate.id)
+            _log_delivery(candidate, "AI detected: Interested", "success")
+        elif detected_status == "not_interested":
+            _save_response(candidate, "not_interested")
+            clear_context(candidate.id)
+            _log_delivery(candidate, "AI detected: Not Interested", "success")
         else:
-            ai_response, detected_status = get_ai_whatsapp_response(
-                candidate_message=message,
-                candidate_name=candidate.full_name,
-                role_name=candidate.role_name,
-                job_description=candidate.job_description,
-            )
+            _log_delivery(candidate, "AI detected: Unclear", "failed")
 
-            if detected_status == "interested":
-                _save_response(candidate, "interested")
-                clear_context(candidate.id)
-                _log_delivery(candidate, "AI detected: Interested", "success")
-            elif detected_status == "not_interested":
-                _save_response(candidate, "not_interested")
-                clear_context(candidate.id)
-                _log_delivery(candidate, "AI detected: Not Interested", "success")
-            else:
-                _log_delivery(candidate, "AI detected: Unclear", "failed")
-
-            _log_conversation(candidate, "outbound", "ai", ai_response, detected_status)
-            send_whatsapp_reply_message.delay(candidate.id, ai_response)
+        _log_conversation(candidate, "outbound", "ai", ai_response, detected_status)
+        send_whatsapp_reply_message.delay(candidate.id, ai_response)
 
     return Response({"status": "received"})

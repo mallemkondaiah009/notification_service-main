@@ -1,4 +1,4 @@
-from .interactive import send_text_message
+from .services import send_text_message
 
 
 MAIN_MENU_TEMPLATE = """👋 Hello {name}!

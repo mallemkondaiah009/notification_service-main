@@ -5,19 +5,26 @@ from delivery_logs.models import DeliveryLog
 from candidate.models import ConversationLog
 
 
-def send_whatsapp(candidate, message, is_initial=False):
-    """Used for plain text replies (AI responses, final confirmations)."""
+def send_text_message(to_phone, message):
+    """Raw Twilio call — single entry point for all outbound WhatsApp sends."""
     try:
         client = Client(
             settings.TWILIO_ACCOUNT_SID,
             settings.TWILIO_AUTH_TOKEN,
         )
-
         client.messages.create(
             body=message,
             from_=settings.TWILIO_WHATSAPP_NUMBER,
-            to=f"whatsapp:{candidate.phone}",
+            to=f"whatsapp:{to_phone}",
         )
+    except Exception as e:
+        raise Exception(f"Failed to send WhatsApp message: {str(e)}")
+
+
+def send_whatsapp(candidate, message, is_initial=False):
+    """Send with full delivery + conversation logging."""
+    try:
+        send_text_message(candidate.phone, message)
 
         DeliveryLog.objects.create(
             candidate=candidate,
