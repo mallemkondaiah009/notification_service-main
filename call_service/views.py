@@ -12,7 +12,7 @@ from rest_framework.decorators import api_view
 from twilio.request_validator import RequestValidator
 
 from candidate.models import Candidate, ConversationLog
-from delivery_logs.models import DeliveryLog
+# from delivery_logs.models import DeliveryLog
 from .call_templates import get_call_twiml, NO_INPUT_TWIML, VOICE, LANGUAGE
 from .handler import handle_call_speech
 
