@@ -149,8 +149,16 @@ TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
 TWILIO_WHATSAPP_NUMBER = os.getenv("TWILIO_WHATSAPP_NUMBER")
 TWILIO_PHONE_NUMBER = os.getenv("TWILIO_PHONE_NUMBER")
 
-CELERY_BROKER_URL    = os.getenv("REDIS_URL")
-CELERY_RESULT_BACKEND = os.getenv("REDIS_BACKEND_FOR_CELERY")
+# Redis
+REDIS_BASE_URL = os.getenv("REDIS_BASE_URL", "redis://localhost:6379")
+# WhatsApp context
+REDIS_CONTEXT_URL = f"{REDIS_BASE_URL}/1"
+# Dedup locks
+REDIS_LOCKS_URL = f"{REDIS_BASE_URL}/2"
+
+# Celery
+CELERY_BROKER_URL     = f"{REDIS_BASE_URL}/0"
+CELERY_RESULT_BACKEND = f"{REDIS_BASE_URL}/0"
 CELERY_ACCEPT_CONTENT = ["json"]
 CELERY_TASK_SERIALIZER = "json"
 CELERY_RESULT_SERIALIZER = "json"
@@ -198,11 +206,13 @@ LOGGING = {
     },
 }
 
-# Redis as cache + session backend
+
+
+# Django cache — use DB3 so it's separate from everything else
 CACHES = {
     "default": {
         "BACKEND": "django_redis.cache.RedisCache",
-        "LOCATION": os.getenv("REDIS_URL"),
+        "LOCATION": f"{REDIS_BASE_URL}/3",
         "OPTIONS": {"CLIENT_CLASS": "django_redis.client.DefaultClient"},
     }
 }

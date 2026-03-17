@@ -1,7 +1,7 @@
 import json
 import re
 
-from shared.redis_client import redis_client  # async redis client
+from shared.redis_client import redis_context  # DB1 — context + jd_cache
 
 # ── Field keyword map ──────────────────────────────────────────────────
 
@@ -243,15 +243,13 @@ def match_speech_to_field(speech: str) -> str | None:
     return _match_speech_to_field_sync(speech)
 
 
-# ── Async Redis cache ──────────────────────────────────────────────────
+# ── Async Redis cache (DB1) ────────────────────────────────────────────
 
 async def cache_jd_answers(candidate_id: int, job_description: str) -> None:
     """
     Pre-computes voice-ready answers for every JD field and stores
-    them in Redis as a single JSON blob (TTL 24 h).
-
-    Called once after a candidate is notified — avoids re-scanning
-    the JD on every voice interaction.
+    them in Redis DB1 as a single JSON blob (TTL 24 h).
+    Called once after a candidate is notified.
     """
     answers: dict = {}
 
@@ -265,7 +263,7 @@ async def cache_jd_answers(candidate_id: int, job_description: str) -> None:
                 "spoken": template.format(answer=clean),
             }
 
-    await redis_client.set(
+    await redis_context.set(
         f"jd_cache:{candidate_id}",
         json.dumps(answers),
         ex=60 * 60 * 24,
@@ -274,15 +272,15 @@ async def cache_jd_answers(candidate_id: int, job_description: str) -> None:
 
 async def get_cached_answer(candidate_id: int, speech: str) -> tuple[str | None, str | None]:
     """
-    Looks up a pre-cached voice answer from Redis.
+    Looks up a pre-cached voice answer from Redis DB1.
     Returns (label, spoken_text) or (None, None) if not found.
     """
     try:
-        cached = await redis_client.get(f"jd_cache:{candidate_id}")
+        cached = await redis_context.get(f"jd_cache:{candidate_id}")
         if not cached:
             return None, None
 
-        answers  = json.loads(cached)
+        answers   = json.loads(cached)
         button_id = _match_speech_to_field_sync(speech)
 
         if not button_id or button_id not in answers:
@@ -297,4 +295,4 @@ async def get_cached_answer(candidate_id: int, speech: str) -> tuple[str | None,
 
 async def invalidate_jd_cache(candidate_id: int) -> None:
     """Deletes the cached JD answers for a candidate (e.g. on JD update)."""
-    await redis_client.delete(f"jd_cache:{candidate_id}")
+    await redis_context.delete(f"jd_cache:{candidate_id}")

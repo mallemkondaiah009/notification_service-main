@@ -3,9 +3,8 @@ from django.conf import settings
 
 CONTEXT_TTL = 60 * 60
 
-_redis = aioredis.from_url(settings.CELERY_BROKER_URL, decode_responses=True)
-
-# ── Context helpers ────────────────────────────────────────────────────
+# DB1 — conversation context only
+_redis = aioredis.from_url(settings.REDIS_CONTEXT_URL, decode_responses=True)
 
 async def set_context(candidate_id, context: str) -> None:
     await _redis.set(f"wa_ctx:{candidate_id}", context, ex=CONTEXT_TTL)

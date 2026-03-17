@@ -14,21 +14,23 @@ Job Description:
 {job_description}
 
 Your job is to:
-1. Understand if the candidate is interested or not interested in the {role_name} position
-2. Answer any questions the candidate asks about the role using the job description above
-3. Respond naturally and professionally
+1. Answer any questions the candidate asks about the role using the job description
+2. Detect ONLY if the candidate has EXPLICITLY confirmed interest or rejection
+3. NEVER assume interest from a question — questions mean the candidate wants more info
 
-Rules:
-- Keep responses short and clear — this is a WhatsApp message
-- Be warm, professional and human
-- If candidate asks about the role, salary, responsibilities → answer using the job description
-- If candidate is interested → thank them and tell them the team will reach out
-- If candidate is not interested → thank them and say you will keep their profile
-- If unclear → respond helpfully then ask again if they are interested
-- Always end with one of these statuses on a new line:
-  STATUS:interested
-  STATUS:not_interested
-  STATUS:unclear
+STRICT RULES:
+- If candidate asks ANY question → answer it professionally and end with STATUS:unclear
+- If candidate says "when is interview", "next steps", "what happens now" → they are likely interested, answer helpfully and end with STATUS:unclear
+- Only use STATUS:interested if candidate EXPLICITLY says "yes I am interested", "I want to apply", "I will join" or very clear confirmation
+- Only use STATUS:not_interested if candidate EXPLICITLY says "no", "not interested" or very clear rejection
+- When in doubt → always use STATUS:unclear
+- Keep responses short, warm and professional — this is WhatsApp
+- NEVER include the STATUS line in the visible message — it is only for internal processing
+- Write your reply first, then on a completely separate new line write only the STATUS tag
+
+RESPONSE FORMAT:
+<your reply to the candidate here>
+STATUS:unclear
 """
 
 
@@ -37,34 +39,60 @@ async def get_ai_whatsapp_response(
     candidate_name: str,
     role_name: str,
     job_description: str,
+    candidate_status: str = "sent",
 ) -> tuple[str, str]:
+
+    # If candidate already marked interested/not_interested in DB
+    # pass that context so AI doesn't contradict it
+    status_context = ""
+    if candidate_status == "interested":
+        status_context = f"\nNOTE: {candidate_name} has already confirmed interest in this role. Answer their questions accordingly."
+    elif candidate_status == "not_interested":
+        status_context = f"\nNOTE: {candidate_name} has already declined this role. Be respectful and helpful."
 
     response = await client.chat.completions.create(
         model="gpt-4o",
         messages=[
-            {"role": "system", "content": _build_system_prompt(candidate_name, role_name, job_description)},
-            {"role": "user",   "content": (
-                f"Candidate name: {candidate_name}\n"
-                f"Role: {role_name}\n"
-                f"Candidate said: {candidate_message}"
-            )},
+            {
+                "role": "system",
+                "content": _build_system_prompt(candidate_name, role_name, job_description) + status_context,
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"Candidate name: {candidate_name}\n"
+                    f"Role: {role_name}\n"
+                    f"Candidate said: {candidate_message}"
+                ),
+            },
         ],
         max_tokens=300,
-        temperature=0.7,
+        temperature=0.4,
     )
 
     full_response = response.choices[0].message.content.strip()
-    status        = "unclear"
+
+    # ── Parse status and clean reply ──────────────────────────────────
+    status = "unclear"
     text_response = full_response
 
     if "STATUS:interested" in full_response:
-        status        = "interested"
-        text_response = full_response.replace("STATUS:interested", "").strip()
+        status = "interested"
+        text_response = full_response.replace("STATUS:interested", "")
     elif "STATUS:not_interested" in full_response:
-        status        = "not_interested"
-        text_response = full_response.replace("STATUS:not_interested", "").strip()
+        status = "not_interested"
+        text_response = full_response.replace("STATUS:not_interested", "")
     elif "STATUS:unclear" in full_response:
-        status        = "unclear"
-        text_response = full_response.replace("STATUS:unclear", "").strip()
+        status = "unclear"
+        text_response = full_response.replace("STATUS:unclear", "")
+
+    # Clean up any leftover STATUS artifacts and trailing whitespace
+    text_response = text_response.replace("STATUS:", "").strip()
+
+    # Remove any trailing empty lines
+    text_response = "\n".join(
+        line for line in text_response.splitlines()
+        if line.strip()
+    ).strip()
 
     return text_response, status
