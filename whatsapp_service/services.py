@@ -1,41 +1,44 @@
-from twilio.rest import Client
+import httpx
+import base64
+import logging
+
 from django.conf import settings
+from candidate.models import Candidate, ConversationLog
 
-from delivery_logs.models import DeliveryLog
-from candidate.models import ConversationLog
+logger = logging.getLogger("whatsapp.services")
 
 
-def send_text_message(to_phone, message):
-    """Raw Twilio call — single entry point for all outbound WhatsApp sends."""
+async def send_text_message(to_phone: str, message: str) -> None:
+    """Raw async Twilio REST call via httpx."""
+    credentials = base64.b64encode(
+        f"{settings.TWILIO_ACCOUNT_SID}:{settings.TWILIO_AUTH_TOKEN}".encode()
+    ).decode()
+
+    url = (
+        f"https://api.twilio.com/2010-04-01/Accounts/"
+        f"{settings.TWILIO_ACCOUNT_SID}/Messages.json"
+    )
+
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        response = await client.post(
+            url,
+            headers={"Authorization": f"Basic {credentials}"},
+            data={
+                "Body": message,
+                "From": settings.TWILIO_WHATSAPP_NUMBER,
+                "To":   f"whatsapp:{to_phone}",
+            },
+        )
+        response.raise_for_status()
+
+
+async def send_whatsapp(candidate: Candidate, message: str, is_initial: bool = False) -> None:
+    """Send with optional initial ConversationLog entry."""
     try:
-        client = Client(
-            settings.TWILIO_ACCOUNT_SID,
-            settings.TWILIO_AUTH_TOKEN,
-        )
-        client.messages.create(
-            body=message,
-            from_=settings.TWILIO_WHATSAPP_NUMBER,
-            to=f"whatsapp:{to_phone}",
-        )
-    except Exception as e:
-        raise Exception(f"Failed to send WhatsApp message: {str(e)}")
-
-
-def send_whatsapp(candidate, message, is_initial=False):
-    """Send with full delivery + conversation logging."""
-    try:
-        send_text_message(candidate.phone, message)
-
-        DeliveryLog.objects.create(
-            candidate=candidate,
-            channel="whatsapp",
-            recipient=candidate.phone,
-            message=message,
-            status="success",
-        )
+        await send_text_message(candidate.phone, message)
 
         if is_initial:
-            ConversationLog.objects.create(
+            await ConversationLog.alog(
                 candidate=candidate,
                 channel="whatsapp",
                 direction="outbound",
@@ -43,13 +46,8 @@ def send_whatsapp(candidate, message, is_initial=False):
                 message=message,
             )
 
-    except Exception as e:
-        DeliveryLog.objects.create(
-            candidate=candidate,
-            channel="whatsapp",
-            recipient=candidate.phone,
-            message=message,
-            status="failed",
-            error_message=str(e),
-        )
+        logger.info("[WHATSAPP] Sent — candidate=%s is_initial=%s", candidate.id, is_initial)
+
+    except Exception as exc:
+        logger.error("[WHATSAPP] Failed — candidate=%s error=%s", candidate.id, exc)
         raise

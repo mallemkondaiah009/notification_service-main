@@ -3,7 +3,7 @@ from rest_framework.response import Response
 from rest_framework import status
 
 from .serializers import NotificationSerializer
-from workers.tasks import send_bulk_notifications
+from workers.tasks import send_bulk_whatsapp_notifications
 
 
 class SendNotificationAPIView(APIView):
@@ -13,7 +13,7 @@ class SendNotificationAPIView(APIView):
         serializer.is_valid(raise_exception=True)
 
         candidate_ids = serializer.validated_data["candidate_ids"]
-        send_bulk_notifications.delay(candidate_ids)
+        send_bulk_whatsapp_notifications.delay(candidate_ids)
 
         return Response(
             {

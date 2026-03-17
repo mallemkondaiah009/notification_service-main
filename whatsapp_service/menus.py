@@ -1,6 +1,5 @@
 from .services import send_text_message
 
-
 MAIN_MENU_TEMPLATE = """👋 Hello {name}!
 
 We are hiring for *{role}*.
@@ -83,38 +82,26 @@ Are you interested in this position?
 0️⃣ Reply *0* — Back to Main Menu"""
 
 
-def send_main_menu(candidate):
-    send_text_message(
+async def send_main_menu(candidate) -> None:
+    await send_text_message(
         candidate.phone,
-        MAIN_MENU_TEMPLATE.format(
-            name=candidate.full_name,
-            role=candidate.role_name,
-        ),
+        MAIN_MENU_TEMPLATE.format(name=candidate.full_name, role=candidate.role_name),
     )
 
+async def send_salary_menu(candidate) -> None:
+    await send_text_message(candidate.phone, SALARY_MENU_TEMPLATE)
 
-def send_salary_menu(candidate):
-    send_text_message(candidate.phone, SALARY_MENU_TEMPLATE)
+async def send_responsibilities_menu(candidate) -> None:
+    await send_text_message(candidate.phone, RESPONSIBILITIES_MENU_TEMPLATE)
 
+async def send_location_menu(candidate) -> None:
+    await send_text_message(candidate.phone, LOCATION_MENU_TEMPLATE)
 
-def send_responsibilities_menu(candidate):
-    send_text_message(candidate.phone, RESPONSIBILITIES_MENU_TEMPLATE)
+async def send_notice_period_menu(candidate) -> None:
+    await send_text_message(candidate.phone, NOTICE_MENU_TEMPLATE)
 
+async def send_benefits_menu(candidate) -> None:
+    await send_text_message(candidate.phone, BENEFITS_MENU_TEMPLATE)
 
-def send_location_menu(candidate):
-    send_text_message(candidate.phone, LOCATION_MENU_TEMPLATE)
-
-
-def send_notice_period_menu(candidate):
-    send_text_message(candidate.phone, NOTICE_MENU_TEMPLATE)
-
-
-def send_benefits_menu(candidate):
-    send_text_message(candidate.phone, BENEFITS_MENU_TEMPLATE)
-
-
-def send_interest_buttons(candidate, answer):
-    send_text_message(
-        candidate.phone,
-        INTEREST_PROMPT.format(answer=answer),
-    )
+async def send_interest_buttons(candidate, answer: str) -> None:
+    await send_text_message(candidate.phone, INTEREST_PROMPT.format(answer=answer))

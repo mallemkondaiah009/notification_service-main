@@ -1,6 +1,10 @@
 import json
 import re
 
+from shared.redis_client import redis_client  # async redis client
+
+# ── Field keyword map ──────────────────────────────────────────────────
+
 JD_FIELD_KEYWORDS = {
     "salary_basic": [
         "basic salary", "basic pay", "fixed salary", "base salary", "monthly salary",
@@ -151,37 +155,39 @@ VOICE_TEMPLATES = {
     "ben_other":        "Regarding other perks and benefits, {answer}",
 }
 
+# ── Private pure-Python helpers (no I/O — stay sync) ──────────────────
 
-def _normalize_speech(text):
+def _normalize_speech(text: str) -> str:
     text = text.lower().strip()
-    fillers = ["um", "uh", "like", "you know", "actually", "basically", "so", "well"]
-    for filler in fillers:
+    for filler in ["um", "uh", "like", "you know", "actually", "basically", "so", "well"]:
         text = re.sub(rf"\b{filler}\b", "", text)
-    text = re.sub(r"\s+", " ", text).strip()
-    return text
+    return re.sub(r"\s+", " ", text).strip()
 
 
-def _clean_for_voice(text):
+def _clean_for_voice(text: str) -> str:
     text = re.sub(r"\*+", "", text)
     text = re.sub(r"_+", "", text)
     text = re.sub(r"#+\s*", "", text)
     text = re.sub(r"^\s*[-•]\s*", "", text, flags=re.MULTILINE)
     text = re.sub(r"\n+", ". ", text)
     text = re.sub(r"\.\s*\.", ".", text)
-    text = re.sub(r"\s+", " ", text).strip()
-    return text
+    return re.sub(r"\s+", " ", text).strip()
 
 
-def extract_answer(button_id, job_description):
+def _extract_answer_sync(button_id: str, job_description: str) -> tuple[str, str | None]:
+    """
+    Pure-Python JD text scan — no I/O, deliberately sync.
+    Used internally by both the sync extract_answer() and async cache builder.
+    """
     keywords = JD_FIELD_KEYWORDS.get(button_id, [])
-    label = FRIENDLY_LABELS.get(button_id, button_id.replace("_", " ").title())
+    label    = FRIENDLY_LABELS.get(button_id, button_id.replace("_", " ").title())
 
     if not keywords:
         return label, None
 
-    lines = job_description.split("\n")
+    lines        = job_description.split("\n")
     result_lines = []
-    capturing = False
+    capturing    = False
 
     for line in lines:
         line_lower = line.lower().strip()
@@ -193,9 +199,9 @@ def extract_answer(button_id, job_description):
 
         if capturing:
             if line.strip() and (
-                line.strip().endswith(":") or
-                line.strip().isupper() or
-                (len(line.strip()) > 3 and line.strip()[0].isupper() and line.strip().endswith(":"))
+                line.strip().endswith(":")
+                or line.strip().isupper()
+                or (len(line.strip()) > 3 and line.strip()[0].isupper() and line.strip().endswith(":"))
             ):
                 break
             if line.strip():
@@ -206,6 +212,7 @@ def extract_answer(button_id, job_description):
     if result_lines:
         return label, "\n".join(result_lines)
 
+    # fallback — first line that contains any keyword
     for line in lines:
         if any(kw in line.lower() for kw in keywords):
             return label, line.strip()
@@ -213,46 +220,81 @@ def extract_answer(button_id, job_description):
     return label, None
 
 
-def match_speech_to_field(speech):
+def _match_speech_to_field_sync(speech: str) -> str | None:
+    """Pure-Python keyword scorer — sync, no I/O."""
     normalized = _normalize_speech(speech)
-    scores = {}
-    for button_id, keywords in JD_FIELD_KEYWORDS.items():
-        score = sum(1 for kw in keywords if kw in normalized)
-        if score > 0:
-            scores[button_id] = score
-    if not scores:
-        return None
-    return max(scores, key=scores.get)
+    scores = {
+        button_id: sum(1 for kw in keywords if kw in normalized)
+        for button_id, keywords in JD_FIELD_KEYWORDS.items()
+    }
+    scores = {k: v for k, v in scores.items() if v > 0}
+    return max(scores, key=scores.get) if scores else None
 
 
-def cache_jd_answers(candidate_id, job_description, redis_client):
-    answers = {}
+# ── Public sync API (used by call_service / voice handler) ────────────
+
+def extract_answer(button_id: str, job_description: str) -> tuple[str, str | None]:
+    """Sync wrapper — kept for call_service compatibility."""
+    return _extract_answer_sync(button_id, job_description)
+
+
+def match_speech_to_field(speech: str) -> str | None:
+    """Sync wrapper — kept for call_service compatibility."""
+    return _match_speech_to_field_sync(speech)
+
+
+# ── Async Redis cache ──────────────────────────────────────────────────
+
+async def cache_jd_answers(candidate_id: int, job_description: str) -> None:
+    """
+    Pre-computes voice-ready answers for every JD field and stores
+    them in Redis as a single JSON blob (TTL 24 h).
+
+    Called once after a candidate is notified — avoids re-scanning
+    the JD on every voice interaction.
+    """
+    answers: dict = {}
+
     for button_id in JD_FIELD_KEYWORDS:
-        label, answer = extract_answer(button_id, job_description)
+        label, answer = _extract_answer_sync(button_id, job_description)
         if answer:
-            clean = _clean_for_voice(answer)
+            clean    = _clean_for_voice(answer)
             template = VOICE_TEMPLATES.get(button_id, "{answer}")
             answers[button_id] = {
-                "label": label,
+                "label":  label,
                 "spoken": template.format(answer=clean),
             }
-    redis_client.set(
+
+    await redis_client.set(
         f"jd_cache:{candidate_id}",
         json.dumps(answers),
         ex=60 * 60 * 24,
     )
 
 
-def get_cached_answer(candidate_id, speech, redis_client):
+async def get_cached_answer(candidate_id: int, speech: str) -> tuple[str | None, str | None]:
+    """
+    Looks up a pre-cached voice answer from Redis.
+    Returns (label, spoken_text) or (None, None) if not found.
+    """
     try:
-        cached = redis_client.get(f"jd_cache:{candidate_id}")
+        cached = await redis_client.get(f"jd_cache:{candidate_id}")
         if not cached:
             return None, None
-        answers = json.loads(cached)
-        button_id = match_speech_to_field(speech)
+
+        answers  = json.loads(cached)
+        button_id = _match_speech_to_field_sync(speech)
+
         if not button_id or button_id not in answers:
             return None, None
+
         entry = answers[button_id]
         return entry["label"], entry["spoken"]
+
     except Exception:
         return None, None
+
+
+async def invalidate_jd_cache(candidate_id: int) -> None:
+    """Deletes the cached JD answers for a candidate (e.g. on JD update)."""
+    await redis_client.delete(f"jd_cache:{candidate_id}")
