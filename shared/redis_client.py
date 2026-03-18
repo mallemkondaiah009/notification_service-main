@@ -2,32 +2,27 @@ import redis
 import redis.asyncio as aioredis
 from django.conf import settings
 
-# ── Async clients ──────────────────────────────────────────────────────
-
-# DB1 — WhatsApp conversation context + jd_cache
+# ── Async — views, quick_replies, jd_parser ───────────────────────────
 redis_context = aioredis.from_url(
     settings.REDIS_CONTEXT_URL,
     decode_responses=True,
 )
 
-# Alias — call_service imports redis_client by name
+# Backward compat alias — call_service imports redis_client
 redis_client = redis_context
 
-# ── Sync clients ───────────────────────────────────────────────────────
-
-# DB0 — Celery broker
+# ── Sync — Celery tasks only ───────────────────────────────────────────
 redis_celery_sync = redis.Redis.from_url(
     settings.CELERY_BROKER_URL,
     decode_responses=True,
 )
 
-# DB2 — dedup locks
 redis_locks_sync = redis.Redis.from_url(
     settings.REDIS_LOCKS_URL,
     decode_responses=True,
 )
 
-# ── Async helpers — views / quick_replies ──────────────────────────────
+# ── Async helpers ──────────────────────────────────────────────────────
 
 async def safe_get(key: str):
     try:
@@ -47,7 +42,7 @@ async def safe_delete(key: str):
     except Exception:
         pass
 
-# ── Sync helpers — call_service / Celery tasks ────────────────────────
+# ── Sync helpers — call_service ────────────────────────────────────────
 
 def safe_incr(key: str) -> None:
     try:

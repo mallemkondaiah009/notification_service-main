@@ -1,6 +1,6 @@
 from django.urls import path
-from .views import WhatsAppWebhook
+from .views import WhatsAppWebhookView
 
 urlpatterns = [
-    path("webhook/", WhatsAppWebhook.as_view()),
+    path("webhook/", WhatsAppWebhookView.as_view()),
 ]

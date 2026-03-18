@@ -2,7 +2,7 @@ import asyncio
 import logging
 
 import redis
-from celery import shared_task
+from celery import shared_task, group
 from celery.exceptions import Ignore
 from django.conf import settings
 from django.utils import timezone
@@ -10,10 +10,10 @@ from django.utils import timezone
 from candidate.models import Candidate
 from whatsapp_service.services import send_text_message
 from whatsapp_service.whatsapp_templates import send_initial_whatsapp
+from shared.jd_parser import cache_jd_answers
 
 logger = logging.getLogger("tasks.whatsapp")
 
-# DB2 — dedup locks only
 _redis_sync = redis.Redis.from_url(
     settings.REDIS_LOCKS_URL,
     decode_responses=True,
@@ -21,14 +21,19 @@ _redis_sync = redis.Redis.from_url(
 
 
 @shared_task
-def send_bulk_whatsapp_notifications(candidate_ids: list[int], campaign_id: str | None = None):
+def send_bulk_whatsapp_notifications(
+    candidate_ids: list[int],
+    campaign_id: str | None = None,
+):
+    """
+    Fan out notifications in batches of 50.
+    Dedup lock prevents double-fire on same campaign_id.
+    """
     if campaign_id:
         lock_key = f"bulk_wa_lock:{campaign_id}"
         if not _redis_sync.set(lock_key, "1", nx=True, ex=3600):
             logger.warning("[TASKS] Already running — campaign=%s", campaign_id)
             raise Ignore()
-
-    from celery import group
 
     batch_size = 50
     for i in range(0, len(candidate_ids), batch_size):
@@ -37,7 +42,10 @@ def send_bulk_whatsapp_notifications(candidate_ids: list[int], campaign_id: str 
             send_whatsapp_notification.s(cid) for cid in batch
         ).apply_async(countdown=(i // batch_size) * 5)
 
-    logger.info("[TASKS] Bulk dispatched — total=%d", len(candidate_ids))
+    logger.info(
+        "[TASKS] Bulk dispatched — total=%d campaign=%s",
+        len(candidate_ids), campaign_id,
+    )
 
 
 @shared_task(
@@ -48,19 +56,42 @@ def send_bulk_whatsapp_notifications(candidate_ids: list[int], campaign_id: str 
     retry_kwargs={"max_retries": 5},
 )
 def send_whatsapp_notification(self, candidate_id: int):
+    """
+    Send initial WhatsApp menu to one candidate.
+    Marks as sent, warms JD cache, invalidates phone cache.
+    """
     try:
-        candidate = Candidate.objects.get(id=candidate_id)
+        candidate = Candidate.objects.select_related("job").get(id=candidate_id)
     except Candidate.DoesNotExist:
         raise Ignore()
+
+    # ── Skip if not pending (comment out for testing) ─────────────────
+    # if candidate.status != "pending":
+    #     logger.info(
+    #         "[TASKS] Skipping — status=%s candidate=%d",
+    #         candidate.status, candidate_id,
+    #     )
+    #     raise Ignore()
 
     logger.info("[TASKS] Sending initial WhatsApp — candidate=%d", candidate_id)
     asyncio.run(send_initial_whatsapp(candidate))
 
+    # Mark as sent
     Candidate.objects.filter(id=candidate_id).update(
         status="sent",
         notification_sent_at=timezone.now(),
     )
     logger.info("[TASKS] Marked sent — candidate=%d", candidate_id)
+
+    # Invalidate phone cache so fresh status is fetched on next webhook
+    asyncio.run(Candidate.ainvalidate_phone_cache(candidate.phone))
+
+    # Warm JD cache — stored once, shared across all candidates with same JD
+    asyncio.run(cache_jd_answers(candidate.job.id, candidate.job.content))
+    logger.info(
+        "[TASKS] JD cache warmed — jd_id=%d candidate=%d",
+        candidate.job.id, candidate_id,
+    )
 
 
 @shared_task(
@@ -71,9 +102,17 @@ def send_whatsapp_notification(self, candidate_id: int):
     retry_kwargs={"max_retries": 5},
 )
 def send_whatsapp_reply_task(self, candidate_id: int, message: str):
+    """
+    Send a WhatsApp reply message.
+    Called fire-and-forget from async webhook view.
+    """
     try:
         candidate = Candidate.objects.get(id=candidate_id)
     except Candidate.DoesNotExist:
+        raise Ignore()
+
+    if not candidate.phone:
+        logger.warning("[TASKS] No phone — candidate=%d", candidate_id)
         raise Ignore()
 
     logger.info("[TASKS] Sending reply — candidate=%d", candidate_id)

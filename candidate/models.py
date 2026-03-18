@@ -1,10 +1,27 @@
+import json
 import logging
 
-from asgiref.sync import sync_to_async
 from django.db import models
 from django.utils import timezone
 
+from shared.redis_client import redis_context
+
 logger = logging.getLogger("whatsapp.models")
+
+CANDIDATE_CACHE_TTL = 60 * 60 * 24  # 24 hours
+
+
+class JobDescription(models.Model):
+    title      = models.CharField(max_length=200)
+    content    = models.TextField(unique=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        indexes = [models.Index(fields=["title"])]
+
+    def __str__(self):
+        return self.title
 
 
 class Candidate(models.Model):
@@ -22,11 +39,17 @@ class Candidate(models.Model):
         ("call",     "Call"),
     )
 
-    full_name       = models.CharField(max_length=200)
-    email           = models.EmailField(blank=True)
-    phone           = models.CharField(max_length=20)
-    role_name       = models.CharField(max_length=200)
-    job_description = models.TextField()
+    full_name    = models.CharField(max_length=200)
+    email        = models.EmailField(blank=True)
+    phone        = models.CharField(max_length=20)
+    role_name    = models.CharField(max_length=200)
+    job          = models.ForeignKey(
+        JobDescription,
+        null=True,
+        blank=True,
+        on_delete=models.PROTECT,
+        related_name="candidates",
+    )
 
     status               = models.CharField(max_length=20, choices=STATUS_CHOICES, default="pending")
     notification_sent_at = models.DateTimeField(null=True, blank=True)
@@ -43,44 +66,127 @@ class Candidate(models.Model):
     def __str__(self):
         return self.full_name
 
-    # ── Async fetch helpers ────────────────────────────────────────────
+    @property
+    def job_description(self) -> str:
+        """Backward compat — call_service uses candidate.job_description."""
+        return self.job.content
+
+    # ── Cache helpers ──────────────────────────────────────────────────
+
+    @classmethod
+    def _cache_key(cls, phone: str) -> str:
+        return f"candidate_phone:{phone}"
+
+    @classmethod
+    async def _aset_cache(cls, candidate: "Candidate") -> None:
+        try:
+            await redis_context.set(
+                cls._cache_key(candidate.phone),
+                json.dumps({
+                    "id":            candidate.id,
+                    "full_name":     candidate.full_name,
+                    "phone":         candidate.phone,
+                    "email":         candidate.email,
+                    "role_name":     candidate.role_name,
+                    "status":        candidate.status,
+                    "responded_via": candidate.responded_via,
+                    "job_id":        candidate.job.id,
+                    "job_title":     candidate.job.title,
+                    "job_content":   candidate.job.content,
+                }),
+                ex=CANDIDATE_CACHE_TTL,
+            )
+        except Exception as exc:
+            logger.error(
+                "[MODELS] _aset_cache failed — phone=%s error=%s",
+                candidate.phone, exc,
+            )
+
+    @classmethod
+    async def ainvalidate_phone_cache(cls, phone: str) -> None:
+        try:
+            await redis_context.delete(cls._cache_key(phone))
+        except Exception as exc:
+            logger.error(
+                "[MODELS] ainvalidate_phone_cache failed — phone=%s error=%s",
+                phone, exc,
+            )
+
+    # ── Async fetch ────────────────────────────────────────────────────
 
     @classmethod
     async def aget_by_phone(cls, phone: str) -> "Candidate":
-        """Fetch by phone — raises DoesNotExist if not found."""
-        return await cls.objects.aget(phone=phone)
+        """
+        Fetch candidate by phone.
+        Redis cache first → DB fallback → re-cache on DB hit.
+        Raises DoesNotExist if not found.
+        """
+        cache_key = cls._cache_key(phone)
+
+        # Try cache first
+        try:
+            cached = await redis_context.get(cache_key)
+            if cached:
+                data      = json.loads(cached)
+                job       = JobDescription(
+                    id      = data["job_id"],
+                    title   = data["job_title"],
+                    content = data["job_content"],
+                )
+                candidate             = cls()
+                candidate.id          = data["id"]
+                candidate.full_name   = data["full_name"]
+                candidate.phone       = data["phone"]
+                candidate.email       = data["email"]
+                candidate.role_name   = data["role_name"]
+                candidate.status      = data["status"]
+                candidate.responded_via = data["responded_via"]
+                candidate.job         = job
+                candidate.job_id      = data["job_id"]
+                return candidate
+        except Exception as exc:
+            logger.warning(
+                "[MODELS] Cache read failed — phone=%s error=%s falling back to DB",
+                phone, exc,
+            )
+
+        # DB fallback — psycopg3 async, no thread pool
+        candidate = await cls.objects.select_related("job").aget(phone=phone)
+        await cls._aset_cache(candidate)
+        return candidate
 
     @classmethod
     async def aget_by_phone_or_none(cls, phone: str) -> "Candidate | None":
-        """Fetch by phone — returns None instead of raising."""
         try:
-            return await cls.objects.aget(phone=phone)
+            return await cls.aget_by_phone(phone)
         except cls.DoesNotExist:
             return None
 
-    # ── Async state helpers ────────────────────────────────────────────
+    @classmethod
+    async def aget_fresh(cls, candidate_id: int) -> "Candidate | None":
+        """Fetch directly from DB — bypasses cache entirely."""
+        try:
+            return await cls.objects.select_related("job").aget(id=candidate_id)
+        except cls.DoesNotExist:
+            return None
+
+    # ── Async state mutations ──────────────────────────────────────────
 
     async def amark_response(self, status: str, via: str) -> None:
-        """Atomically update status + responded_via + responded_at."""
         self.status        = status
         self.responded_via = via
         self.responded_at  = timezone.now()
         await self.asave(update_fields=["status", "responded_via", "responded_at"])
+        await self.ainvalidate_phone_cache(self.phone)
 
     async def amark_sent(self) -> None:
-        """Mark candidate as notified after initial WhatsApp send."""
         self.status               = "sent"
         self.notification_sent_at = timezone.now()
         await self.asave(update_fields=["status", "notification_sent_at"])
+        await self.ainvalidate_phone_cache(self.phone)
 
     async def ais_already_decided(self) -> bool:
-        """True if candidate already responded — skip re-processing."""
         return self.status in ("interested", "not_interested")
-
-    async def arefresh(self) -> "Candidate":
-        """Re-fetch latest state from DB — useful after Celery task updates."""
-        await self.arefresh_from_db()
-        return self
 
 
 class ConversationLog(models.Model):
@@ -103,22 +209,17 @@ class ConversationLog(models.Model):
     def __str__(self):
         return f"[{self.channel}] {self.candidate} | {self.sender} | {self.created_at}"
 
-    # ── Async write ────────────────────────────────────────────────────
-
     @classmethod
     async def alog(
         cls,
-        candidate: Candidate,
+        candidate: "Candidate",
         channel: str,
         direction: str,
         sender: str,
         message: str,
         ai_detected_status: str | None = None,
     ) -> "ConversationLog | None":
-        """
-        Create a log entry. Never raises — webhook must never crash
-        because of a logging failure.
-        """
+        """Never raises — logging failure must never crash the webhook."""
         try:
             return await cls.objects.acreate(
                 candidate=candidate,
@@ -132,67 +233,45 @@ class ConversationLog(models.Model):
             logger.error("[MODELS] ConversationLog.alog failed — %s", exc)
             return None
 
-    # ── Async read ─────────────────────────────────────────────────────
-
     @classmethod
     async def aget_recent(
         cls,
-        candidate: Candidate,
+        candidate: "Candidate",
         channel: str = "whatsapp",
         limit: int = 5,
     ) -> list[dict]:
         """
-        Returns last N messages as plain dicts for AI conversation history.
-
-        Uses sync_to_async with a single DB hit — queryset slicing
-        cannot be awaited directly in Django ORM.
+        Returns last N messages as plain dicts for AI history.
+        psycopg3 async — no sync_to_async needed.
         """
-        @sync_to_async
-        def _fetch() -> list[dict]:
-            qs = (
+        try:
+            result = []
+            async for entry in (
                 cls.objects
                 .filter(candidate=candidate, channel=channel)
                 .order_by("-created_at")
-                .values("sender", "message")[:limit]
-            )
-            return list(reversed(list(qs)))
-
-        return await _fetch()
-
-    @classmethod
-    async def aget_last_inbound(
-        cls,
-        candidate: Candidate,
-        channel: str = "whatsapp",
-    ) -> "ConversationLog | None":
-        """Returns the most recent inbound message from the candidate."""
-        try:
-            return await cls.objects.filter(
-                candidate=candidate,
-                channel=channel,
-                direction="inbound",
-            ).alatest("created_at")
-        except cls.DoesNotExist:
-            return None
+                .values("sender", "message", "direction")[:limit]
+            ):
+                result.append(entry)
+            result.reverse()
+            return result
+        except Exception as exc:
+            logger.error("[MODELS] aget_recent failed — %s", exc)
+            return []
 
     @classmethod
     async def acount_today(
         cls,
-        candidate: Candidate,
+        candidate: "Candidate",
         channel: str = "whatsapp",
     ) -> int:
-        """
-        Count messages today — used for rate limiting checks.
-        """
-        from django.utils.timezone import now
-        today = now().date()
-
-        @sync_to_async
-        def _count() -> int:
-            return cls.objects.filter(
+        """Count messages today — used for rate limiting."""
+        try:
+            today = timezone.now().date()
+            return await cls.objects.filter(
                 candidate=candidate,
                 channel=channel,
                 created_at__date=today,
-            ).count()
-
-        return await _count()
+            ).acount()
+        except Exception:
+            return 0
