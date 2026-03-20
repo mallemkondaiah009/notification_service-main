@@ -14,9 +14,9 @@ from django.contrib.staticfiles.handlers import ASGIStaticFilesHandler
 
 os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'config.settings')
 
-application = get_asgi_application()
-
-application = ASGIStaticFilesHandler(application)
+# Get the Django ASGI application
+django_asgi_app = get_asgi_application()
+django_asgi_app = ASGIStaticFilesHandler(django_asgi_app)
 
 
 async def application(scope, receive, send):
@@ -47,4 +47,4 @@ async def application(scope, receive, send):
                 await send({"type": "lifespan.shutdown.complete"})
                 return
     else:
-        await django_app(scope, receive, send)
+        await django_asgi_app(scope, receive, send)
