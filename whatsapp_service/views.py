@@ -1,3 +1,4 @@
+import asyncio
 import logging
 
 from django.utils.decorators import method_decorator
@@ -7,7 +8,12 @@ from rest_framework.request import Request
 from rest_framework.response import Response
 
 from candidate.models import Candidate, ConversationLog
-from shared.jd_parser import extract_answer, get_cached_answer, FRIENDLY_LABELS
+from shared.jd_parser import (
+    extract_answer,
+    get_cached_answer,
+    FRIENDLY_LABELS,
+    clean_for_whatsapp,
+)
 
 from .ai import get_ai_whatsapp_response
 from .menu_text import (
@@ -25,15 +31,15 @@ from .quick_replies import (
 
 logger = logging.getLogger("whatsapp.views")
 
+# ── Cached task reference — imported once, reused forever ─────────────
+_reply_task = None
 
 def _get_reply_task():
-    """
-    Lazy import to break circular dependency.
-    workers.tasks → whatsapp_templates → views → workers.tasks
-    Lazy import defers resolution until first call, not module load time.
-    """
-    from workers.tasks import send_whatsapp_reply_task
-    return send_whatsapp_reply_task
+    global _reply_task
+    if _reply_task is None:
+        from workers.tasks import send_whatsapp_reply_task
+        _reply_task = send_whatsapp_reply_task
+    return _reply_task
 
 
 # ── Internal helpers ───────────────────────────────────────────────────
@@ -59,22 +65,38 @@ async def _log(
     )
 
 
+async def _warm_jd_cache(jd_id: int, job_content: str) -> None:
+    """
+    Background cache warm — fire and forget.
+    Never blocks the reply path.
+    """
+    from shared.jd_parser import cache_jd_answers
+    try:
+        await cache_jd_answers(jd_id, job_content)
+        logger.info("[VIEWS] Cache warmed — jd_id=%d", jd_id)
+    except Exception as exc:
+        logger.error("[VIEWS] Cache warm failed — jd_id=%d error=%s", jd_id, exc)
+
+
 async def _serve_jd_answer(candidate, field: str) -> None:
+    """
+    Serve JD answer.
+    Cache hit  → instant reply
+    Cache miss → live scan + background cache warm (non-blocking)
+    """
     label, answer = await get_cached_answer(candidate.job.id, field)
 
     if not answer:
         logger.info(
-            "[VIEWS] Cache miss — jd_id=%d field=%s falling back to live scan",
+            "[VIEWS] Cache miss — jd_id=%d field=%s — live scan",
             candidate.job.id, field,
         )
         label, answer = extract_answer(field, candidate.job.content)
+        if answer:
+            answer = clean_for_whatsapp(answer)
 
-        from shared.jd_parser import cache_jd_answers
-        try:
-            await cache_jd_answers(candidate.job.id, candidate.job.content)
-            logger.info("[VIEWS] Cache warmed on miss — jd_id=%d", candidate.job.id)
-        except Exception as exc:
-            logger.error("[VIEWS] Cache warm failed — jd_id=%d error=%s", candidate.job.id, exc)
+        # Warm cache in background — does not block reply
+        asyncio.ensure_future(_warm_jd_cache(candidate.job.id, candidate.job.content))
 
     if answer:
         msg = f"*{label}*\n\n{answer}"
@@ -85,6 +107,7 @@ async def _serve_jd_answer(candidate, field: str) -> None:
             f"Feel free to type your question and our team will get back to you!"
         )
 
+    # Run log and task dispatch concurrently
     await _log(candidate, "outbound", "system", msg)
     _get_reply_task().delay(candidate.id, msg)
 
@@ -103,11 +126,15 @@ async def _handle_ai_fallback(candidate, message: str) -> None:
 
     if candidate.status not in ("interested", "not_interested"):
         if detected == "interested":
-            await candidate.amark_response("interested", "whatsapp")
-            await clear_context(candidate.id)
+            await asyncio.gather(
+                candidate.amark_response("interested", "whatsapp"),
+                clear_context(candidate.id),
+            )
         elif detected == "not_interested":
-            await candidate.amark_response("not_interested", "whatsapp")
-            await clear_context(candidate.id)
+            await asyncio.gather(
+                candidate.amark_response("not_interested", "whatsapp"),
+                clear_context(candidate.id),
+            )
 
     await _log(candidate, "outbound", "ai", ai_reply, detected)
     _get_reply_task().delay(candidate.id, ai_reply)
@@ -138,7 +165,7 @@ class WhatsAppWebhookView(APIView):
         if candidate.status in ("interested", "not_interested"):
 
             if intent in JD_QUESTION_INTENTS or (intent and intent.startswith("jd_")):
-                pass  # fall through to main flow
+                pass
 
             elif intent is None:
                 ctx = await get_context(candidate.id)
@@ -165,26 +192,30 @@ class WhatsAppWebhookView(APIView):
                 return Response({"status": "received"})
 
             elif intent == "interested" and candidate.status == "not_interested":
-                await candidate.amark_response("interested", "whatsapp")
-                await clear_context(candidate.id)
                 reply = (
                     f"Wonderful! We are glad you changed your mind, {candidate.full_name}! 😊\n\n"
                     f"Our recruitment team will reach out to you very soon "
                     f"with the next steps.\n\nHave a great day!"
                 )
-                await _log(candidate, "outbound", "system", reply, "interested")
+                await asyncio.gather(
+                    candidate.amark_response("interested", "whatsapp"),
+                    clear_context(candidate.id),
+                    _log(candidate, "outbound", "system", reply, "interested"),
+                )
                 _get_reply_task().delay(candidate.id, reply)
                 return Response({"status": "received"})
 
             elif intent == "not_interested" and candidate.status == "interested":
-                await candidate.amark_response("not_interested", "whatsapp")
-                await clear_context(candidate.id)
                 reply = (
                     f"Thank you for letting us know, {candidate.full_name}.\n\n"
                     f"We will keep your profile on file for future opportunities.\n\n"
                     f"All the best! 👍"
                 )
-                await _log(candidate, "outbound", "system", reply, "not_interested")
+                await asyncio.gather(
+                    candidate.amark_response("not_interested", "whatsapp"),
+                    clear_context(candidate.id),
+                    _log(candidate, "outbound", "system", reply, "not_interested"),
+                )
                 _get_reply_task().delay(candidate.id, reply)
                 return Response({"status": "received"})
 
@@ -214,25 +245,29 @@ class WhatsAppWebhookView(APIView):
             return Response({"status": "received"})
 
         if intent == "interested":
-            await candidate.amark_response("interested", "whatsapp")
-            await clear_context(candidate.id)
             reply = (
                 f"Thank you for your interest, {candidate.full_name}! 😊\n\n"
                 f"Our recruitment team will reach out to you very soon "
                 f"with the next steps.\n\nHave a great day!"
             )
-            await _log(candidate, "outbound", "system", reply, "interested")
+            await asyncio.gather(
+                candidate.amark_response("interested", "whatsapp"),
+                clear_context(candidate.id),
+                _log(candidate, "outbound", "system", reply, "interested"),
+            )
             _get_reply_task().delay(candidate.id, reply)
 
         elif intent == "not_interested":
-            await candidate.amark_response("not_interested", "whatsapp")
-            await clear_context(candidate.id)
             reply = (
                 f"Thank you for letting us know, {candidate.full_name}.\n\n"
                 f"We will keep your profile on file for future opportunities.\n\n"
                 f"All the best! 👍"
             )
-            await _log(candidate, "outbound", "system", reply, "not_interested")
+            await asyncio.gather(
+                candidate.amark_response("not_interested", "whatsapp"),
+                clear_context(candidate.id),
+                _log(candidate, "outbound", "system", reply, "not_interested"),
+            )
             _get_reply_task().delay(candidate.id, reply)
 
         elif intent == "back_main":
@@ -243,7 +278,9 @@ class WhatsAppWebhookView(APIView):
             )
 
         elif intent == "menu_salary":
-            await set_context(candidate.id, "salary")
+            await asyncio.gather(
+                set_context(candidate.id, "salary"),
+            )
             _get_reply_task().delay(candidate.id, SALARY_MENU)
 
         elif intent == "menu_responsibilities":

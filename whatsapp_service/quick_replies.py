@@ -333,14 +333,25 @@ def _detect_topic(normalized: str) -> str | None:
 
 async def resolve_intent(candidate_id: int, message: str) -> str | None:
     normalized = message.strip().lower()
-    context    = await get_context(candidate_id)
 
-    # Tier 1 — explicit yes / no / navigation (pure Python, instant)
+    # Tier 1 — pure Python, no Redis needed
     intent = _match_intent(normalized)
     if intent:
         return intent
 
-    # Tier 2a — numbered reply inside active sub-menu (instant)
+    # Main menu numbers — no Redis needed
+    if normalized in MAIN_MENU_MAP:
+        return MAIN_MENU_MAP[normalized]
+
+    # Tier 2c — natural language topic — no Redis needed
+    topic = _detect_topic(normalized)
+    if topic:
+        return f"jd_{topic}"
+
+    # Only fetch context for sub-menu number resolution
+    # ~80% of messages never reach this line
+    context = await get_context(candidate_id)
+
     sub_maps = {
         "salary":           SALARY_SUB_MAP,
         "responsibilities": RESP_SUB_MAP,
@@ -351,14 +362,4 @@ async def resolve_intent(candidate_id: int, message: str) -> str | None:
     if context in sub_maps and normalized in sub_maps[context]:
         return sub_maps[context][normalized]
 
-    # Tier 2b — main menu number (instant)
-    if normalized in MAIN_MENU_MAP:
-        return MAIN_MENU_MAP[normalized]
-
-    # Tier 2c — natural language JD topic (instant)
-    topic = _detect_topic(normalized)
-    if topic:
-        return f"jd_{topic}"
-
-    # Tier 3 — AI fallback (only genuinely ambiguous messages)
     return None

@@ -3,7 +3,7 @@ import logging
 
 import redis
 from celery import shared_task, group
-from celery.exceptions import Ignore
+from celery.exceptions import Ignore, SoftTimeLimitExceeded
 from django.conf import settings
 from django.utils import timezone
 
@@ -25,10 +25,6 @@ def send_bulk_whatsapp_notifications(
     candidate_ids: list[int],
     campaign_id: str | None = None,
 ):
-    """
-    Fan out notifications in batches of 50.
-    Dedup lock prevents double-fire on same campaign_id.
-    """
     if campaign_id:
         lock_key = f"bulk_wa_lock:{campaign_id}"
         if not _redis_sync.set(lock_key, "1", nx=True, ex=3600):
@@ -54,18 +50,15 @@ def send_bulk_whatsapp_notifications(
     retry_backoff=True,
     retry_backoff_max=600,
     retry_kwargs={"max_retries": 5},
+    soft_time_limit=10,
+    time_limit=15,
 )
 def send_whatsapp_notification(self, candidate_id: int):
-    """
-    Send initial WhatsApp menu to one candidate.
-    Marks as sent, warms JD cache, invalidates phone cache.
-    """
     try:
         candidate = Candidate.objects.select_related("job").get(id=candidate_id)
     except Candidate.DoesNotExist:
         raise Ignore()
 
-    # ── Skip if not pending (comment out for testing) ─────────────────
     # if candidate.status != "pending":
     #     logger.info(
     #         "[TASKS] Skipping — status=%s candidate=%d",
@@ -73,25 +66,27 @@ def send_whatsapp_notification(self, candidate_id: int):
     #     )
     #     raise Ignore()
 
-    logger.info("[TASKS] Sending initial WhatsApp — candidate=%d", candidate_id)
-    asyncio.run(send_initial_whatsapp(candidate))
+    try:
+        logger.info("[TASKS] Sending initial WhatsApp — candidate=%d", candidate_id)
+        asyncio.run(send_initial_whatsapp(candidate))
 
-    # Mark as sent
-    Candidate.objects.filter(id=candidate_id).update(
-        status="sent",
-        notification_sent_at=timezone.now(),
-    )
-    logger.info("[TASKS] Marked sent — candidate=%d", candidate_id)
+        Candidate.objects.filter(id=candidate_id).update(
+            status="sent",
+            notification_sent_at=timezone.now(),
+        )
+        logger.info("[TASKS] Marked sent — candidate=%d", candidate_id)
 
-    # Invalidate phone cache so fresh status is fetched on next webhook
-    asyncio.run(Candidate.ainvalidate_phone_cache(candidate.phone))
+        asyncio.run(Candidate.ainvalidate_phone_cache(candidate.phone))
 
-    # Warm JD cache — stored once, shared across all candidates with same JD
-    asyncio.run(cache_jd_answers(candidate.job.id, candidate.job.content))
-    logger.info(
-        "[TASKS] JD cache warmed — jd_id=%d candidate=%d",
-        candidate.job.id, candidate_id,
-    )
+        asyncio.run(cache_jd_answers(candidate.job.id, candidate.job.content))
+        logger.info(
+            "[TASKS] JD cache warmed — jd_id=%d candidate=%d",
+            candidate.job.id, candidate_id,
+        )
+
+    except SoftTimeLimitExceeded:
+        logger.error("[TASKS] Soft time limit — candidate=%d", candidate_id)
+        raise
 
 
 @shared_task(
@@ -100,12 +95,10 @@ def send_whatsapp_notification(self, candidate_id: int):
     retry_backoff=True,
     retry_backoff_max=600,
     retry_kwargs={"max_retries": 5},
+    soft_time_limit=10,
+    time_limit=15,
 )
 def send_whatsapp_reply_task(self, candidate_id: int, message: str):
-    """
-    Send a WhatsApp reply message.
-    Called fire-and-forget from async webhook view.
-    """
     try:
         candidate = Candidate.objects.get(id=candidate_id)
     except Candidate.DoesNotExist:
@@ -115,5 +108,10 @@ def send_whatsapp_reply_task(self, candidate_id: int, message: str):
         logger.warning("[TASKS] No phone — candidate=%d", candidate_id)
         raise Ignore()
 
-    logger.info("[TASKS] Sending reply — candidate=%d", candidate_id)
-    asyncio.run(send_text_message(candidate.phone, message))
+    try:
+        logger.info("[TASKS] Sending reply — candidate=%d", candidate_id)
+        asyncio.run(send_text_message(candidate.phone, message))
+
+    except SoftTimeLimitExceeded:
+        logger.error("[TASKS] Soft time limit — candidate=%d", candidate_id)
+        raise

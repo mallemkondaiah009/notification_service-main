@@ -3,6 +3,7 @@ import logging
 
 from django.db import models
 from django.utils import timezone
+from django.utils.timezone import datetime
 
 from shared.redis_client import redis_context
 
@@ -79,20 +80,30 @@ class Candidate(models.Model):
 
     @classmethod
     async def _aset_cache(cls, candidate: "Candidate") -> None:
+        """
+        Write candidate + job to Redis cache.
+        Includes all datetime fields as ISO strings.
+        """
         try:
             await redis_context.set(
                 cls._cache_key(candidate.phone),
                 json.dumps({
-                    "id":            candidate.id,
-                    "full_name":     candidate.full_name,
-                    "phone":         candidate.phone,
-                    "email":         candidate.email,
-                    "role_name":     candidate.role_name,
-                    "status":        candidate.status,
-                    "responded_via": candidate.responded_via,
-                    "job_id":        candidate.job.id,
-                    "job_title":     candidate.job.title,
-                    "job_content":   candidate.job.content,
+                    "id":                   candidate.id,
+                    "full_name":            candidate.full_name,
+                    "phone":                candidate.phone,
+                    "email":                candidate.email,
+                    "role_name":            candidate.role_name,
+                    "status":               candidate.status,
+                    "responded_via":        candidate.responded_via,
+                    # ── datetime fields stored as ISO strings ──────────
+                    "responded_at":         candidate.responded_at.isoformat()
+                                            if candidate.responded_at else None,
+                    "notification_sent_at": candidate.notification_sent_at.isoformat()
+                                            if candidate.notification_sent_at else None,
+                    # ── job FK fields ──────────────────────────────────
+                    "job_id":               candidate.job.id,
+                    "job_title":            candidate.job.title,
+                    "job_content":          candidate.job.content,
                 }),
                 ex=CANDIDATE_CACHE_TTL,
             )
@@ -104,6 +115,7 @@ class Candidate(models.Model):
 
     @classmethod
     async def ainvalidate_phone_cache(cls, phone: str) -> None:
+        """Delete candidate cache — call after any status update."""
         try:
             await redis_context.delete(cls._cache_key(phone))
         except Exception as exc:
@@ -123,40 +135,55 @@ class Candidate(models.Model):
         """
         cache_key = cls._cache_key(phone)
 
-        # Try cache first
+        # ── Try cache ──────────────────────────────────────────────────
         try:
             cached = await redis_context.get(cache_key)
             if cached:
-                data      = json.loads(cached)
-                job       = JobDescription(
+                data = json.loads(cached)
+
+                job              = JobDescription(
                     id      = data["job_id"],
                     title   = data["job_title"],
                     content = data["job_content"],
                 )
-                candidate             = cls()
-                candidate.id          = data["id"]
-                candidate.full_name   = data["full_name"]
-                candidate.phone       = data["phone"]
-                candidate.email       = data["email"]
-                candidate.role_name   = data["role_name"]
-                candidate.status      = data["status"]
-                candidate.responded_via = data["responded_via"]
-                candidate.job         = job
-                candidate.job_id      = data["job_id"]
+
+                candidate                    = cls()
+                candidate.id                 = data["id"]
+                candidate.full_name          = data["full_name"]
+                candidate.phone              = data["phone"]
+                candidate.email              = data["email"]
+                candidate.role_name          = data["role_name"]
+                candidate.status             = data["status"]
+                candidate.responded_via      = data["responded_via"]
+                candidate.job                = job
+                candidate.job_id             = data["job_id"]
+
+                # ── Restore datetime fields ────────────────────────────
+                candidate.responded_at = (
+                    datetime.fromisoformat(data["responded_at"])
+                    if data.get("responded_at") else None
+                )
+                candidate.notification_sent_at = (
+                    datetime.fromisoformat(data["notification_sent_at"])
+                    if data.get("notification_sent_at") else None
+                )
+
                 return candidate
+
         except Exception as exc:
             logger.warning(
-                "[MODELS] Cache read failed — phone=%s error=%s falling back to DB",
+                "[MODELS] Cache read failed — phone=%s error=%s — falling back to DB",
                 phone, exc,
             )
 
-        # DB fallback — psycopg3 async, no thread pool
+        # ── DB fallback ────────────────────────────────────────────────
         candidate = await cls.objects.select_related("job").aget(phone=phone)
         await cls._aset_cache(candidate)
         return candidate
 
     @classmethod
     async def aget_by_phone_or_none(cls, phone: str) -> "Candidate | None":
+        """Fetch by phone — returns None instead of raising."""
         try:
             return await cls.aget_by_phone(phone)
         except cls.DoesNotExist:
@@ -173,6 +200,10 @@ class Candidate(models.Model):
     # ── Async state mutations ──────────────────────────────────────────
 
     async def amark_response(self, status: str, via: str) -> None:
+        """
+        Update status + responded_via + responded_at atomically.
+        Invalidates cache so next fetch gets fresh data from DB.
+        """
         self.status        = status
         self.responded_via = via
         self.responded_at  = timezone.now()
@@ -180,6 +211,7 @@ class Candidate(models.Model):
         await self.ainvalidate_phone_cache(self.phone)
 
     async def amark_sent(self) -> None:
+        """Mark as notified — called after initial WhatsApp send."""
         self.status               = "sent"
         self.notification_sent_at = timezone.now()
         await self.asave(update_fields=["status", "notification_sent_at"])
@@ -242,13 +274,19 @@ class ConversationLog(models.Model):
     ) -> list[dict]:
         """
         Returns last N messages as plain dicts for AI history.
+        Only returns candidate and ai messages — excludes system menu
+        messages so AI history stays clean and relevant.
         psycopg3 async — no sync_to_async needed.
         """
         try:
             result = []
             async for entry in (
                 cls.objects
-                .filter(candidate=candidate, channel=channel)
+                .filter(
+                    candidate=candidate,
+                    channel=channel,
+                    sender__in=["candidate", "ai"],  # exclude system menu messages
+                )
                 .order_by("-created_at")
                 .values("sender", "message", "direction")[:limit]
             ):

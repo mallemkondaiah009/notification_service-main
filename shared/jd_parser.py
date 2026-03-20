@@ -159,34 +159,28 @@ VOICE_TEMPLATES = {
 }
 
 
-# ── Pure Python helpers — no I/O ───────────────────────────────────────
+# ── Public text cleaners ───────────────────────────────────────────────
 
-def _normalize_speech(text: str) -> str:
-    text = text.lower().strip()
-    for filler in ["um", "uh", "like", "you know", "actually", "basically", "so", "well"]:
-        text = re.sub(rf"\b{filler}\b", "", text)
-    return re.sub(r"\s+", " ", text).strip()
-
-
-def _clean_for_whatsapp(text: str) -> str:
+def clean_for_whatsapp(text: str) -> str:
     """
-    Clean text for WhatsApp display.
+    Public — used by views.py for live scan fallback.
+    Cleans text for WhatsApp display.
     Keeps line breaks. Strips bullets, hyphens, markdown.
     """
     lines = []
     for line in text.splitlines():
         line = line.strip()
-        line = re.sub(r"^[-•*]\s*", "", line)      # strip leading bullets
+        line = re.sub(r"^[-•*]\s*", "", line)           # strip leading bullets
         line = re.sub(r"\*{2}(.+?)\*{2}", r"\1", line)  # strip bold **text**
-        line = re.sub(r"\*(.+?)\*", r"\1", line)   # strip italic *text*
+        line = re.sub(r"\*(.+?)\*", r"\1", line)         # strip italic *text*
         if line:
             lines.append(line)
     return "\n".join(lines)
 
 
-def _clean_for_voice(text: str) -> str:
+def clean_for_voice(text: str) -> str:
     """
-    Clean text for voice/call service.
+    Public — used by call_service.
     Single line, no bullets, no markdown.
     """
     text = re.sub(r"\*+", "", text)
@@ -197,6 +191,15 @@ def _clean_for_voice(text: str) -> str:
     text = re.sub(r"\.\s*\.", ".", text)
     text = re.sub(r"\s+", " ", text).strip()
     return text.strip(". ")
+
+
+# ── Private helpers ────────────────────────────────────────────────────
+
+def _normalize_speech(text: str) -> str:
+    text = text.lower().strip()
+    for filler in ["um", "uh", "like", "you know", "actually", "basically", "so", "well"]:
+        text = re.sub(rf"\b{filler}\b", "", text)
+    return re.sub(r"\s+", " ", text).strip()
 
 
 def _extract_answer_sync(button_id: str, job_description: str) -> tuple[str, str | None]:
@@ -220,7 +223,6 @@ def _extract_answer_sync(button_id: str, job_description: str) -> tuple[str, str
 
         if any(kw in line_lower for kw in keywords):
             capturing = True
-            # Skip section headers — lines ending with : or short all-caps
             if (
                 line_clean.endswith(":")
                 or line_clean.upper() == line_clean
@@ -231,7 +233,6 @@ def _extract_answer_sync(button_id: str, job_description: str) -> tuple[str, str
             continue
 
         if capturing:
-            # Stop at new section header
             if line_clean and (
                 line_clean.endswith(":")
                 or line_clean.isupper()
@@ -246,7 +247,6 @@ def _extract_answer_sync(button_id: str, job_description: str) -> tuple[str, str
     if result_lines:
         return label, "\n".join(result_lines)
 
-    # Fallback — first non-header line after keyword match
     capturing = False
     for line in lines:
         line_lower = line.lower().strip()
@@ -263,7 +263,6 @@ def _extract_answer_sync(button_id: str, job_description: str) -> tuple[str, str
 
 
 def _match_speech_to_field_sync(speech: str) -> str | None:
-    """Score keywords against speech — returns best matching field."""
     normalized = _normalize_speech(speech)
     scores = {
         button_id: sum(1 for kw in keywords if kw in normalized)
@@ -271,6 +270,21 @@ def _match_speech_to_field_sync(speech: str) -> str | None:
     }
     scores = {k: v for k, v in scores.items() if v > 0}
     return max(scores, key=scores.get) if scores else None
+
+
+def _build_answers(job_description: str) -> dict:
+    """Build full answers dict from JD text."""
+    answers = {}
+    for button_id in JD_FIELD_KEYWORDS:
+        label, answer = _extract_answer_sync(button_id, job_description)
+        if answer:
+            template = VOICE_TEMPLATES.get(button_id, "{answer}")
+            answers[button_id] = {
+                "label":  label,
+                "raw":    clean_for_whatsapp(answer),
+                "spoken": template.format(answer=clean_for_voice(answer)),
+            }
+    return answers
 
 
 # ── Public sync API — call_service compatibility ───────────────────────
@@ -283,34 +297,14 @@ def match_speech_to_field(speech: str) -> str | None:
     return _match_speech_to_field_sync(speech)
 
 
-# ── Cache helpers ──────────────────────────────────────────────────────
-
-def _build_answers(job_description: str) -> dict:
-    """
-    Build full answers dict from JD text.
-    Pure Python — called from both async cache builder and sync fallback.
-    """
-    answers = {}
-    for button_id in JD_FIELD_KEYWORDS:
-        label, answer = _extract_answer_sync(button_id, job_description)
-        if answer:
-            template = VOICE_TEMPLATES.get(button_id, "{answer}")
-            answers[button_id] = {
-                "label":  label,
-                "raw":    _clean_for_whatsapp(answer),
-                "spoken": template.format(answer=_clean_for_voice(answer)),
-            }
-    return answers
-
-
 # ── Async Redis cache ──────────────────────────────────────────────────
 
 async def cache_jd_answers(jd_id: int, job_description: str) -> None:
     """
     Build and cache JD answers by JD ID.
-    Stored once — shared across all candidates with the same JD.
-    TTL: 7 days.
     Always overwrites — ensures cache is always fresh.
+    Stored once, shared across all candidates with same JD.
+    TTL: 7 days.
     """
     cache_key = f"jd_answers:{jd_id}"
 
@@ -332,7 +326,10 @@ async def cache_jd_answers(jd_id: int, job_description: str) -> None:
         )
 
     except Exception as exc:
-        logger.error("[JD_PARSER] cache_jd_answers failed — jd_id=%d error=%s", jd_id, exc)
+        logger.error(
+            "[JD_PARSER] cache_jd_answers failed — jd_id=%d error=%s",
+            jd_id, exc,
+        )
 
 
 async def get_cached_answer(
@@ -341,7 +338,7 @@ async def get_cached_answer(
 ) -> tuple[str | None, str | None]:
     """
     Get WhatsApp-ready answer from cache by JD ID and field.
-    Returns (label, raw_text) or (None, None) on miss.
+    Returns (label, raw_clean_text) or (None, None) on miss.
     """
     try:
         cached = await redis_context.get(f"jd_answers:{jd_id}")
@@ -349,8 +346,8 @@ async def get_cached_answer(
             return None, None
 
         answers = json.loads(cached)
+        entry   = answers.get(field)
 
-        entry = answers.get(field)
         if not entry:
             return None, None
 
@@ -403,7 +400,10 @@ async def invalidate_jd_cache(jd_id: int) -> None:
         await redis_context.delete(f"jd_answers:{jd_id}")
         logger.info("[JD_PARSER] Cache invalidated — jd_id=%d", jd_id)
     except Exception as exc:
-        logger.error("[JD_PARSER] invalidate_jd_cache failed — jd_id=%d error=%s", jd_id, exc)
+        logger.error(
+            "[JD_PARSER] invalidate_jd_cache failed — jd_id=%d error=%s",
+            jd_id, exc,
+        )
 
 
 async def is_jd_cached(jd_id: int) -> bool:

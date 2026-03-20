@@ -2,24 +2,31 @@ import redis
 import redis.asyncio as aioredis
 from django.conf import settings
 
-# ── Async — views, quick_replies, jd_parser ───────────────────────────
+# ── Async clients with connection pools ───────────────────────────────
+
 redis_context = aioredis.from_url(
     settings.REDIS_CONTEXT_URL,
     decode_responses=True,
+    max_connections=50,        # ← pool size for 500 concurrent requests
+    socket_connect_timeout=2,
+    socket_timeout=2,
+    retry_on_timeout=True,
 )
 
-# Backward compat alias — call_service imports redis_client
 redis_client = redis_context
 
-# ── Sync — Celery tasks only ───────────────────────────────────────────
+# ── Sync clients ───────────────────────────────────────────────────────
+
 redis_celery_sync = redis.Redis.from_url(
     settings.CELERY_BROKER_URL,
     decode_responses=True,
+    max_connections=20,
 )
 
 redis_locks_sync = redis.Redis.from_url(
     settings.REDIS_LOCKS_URL,
     decode_responses=True,
+    max_connections=10,
 )
 
 # ── Async helpers ──────────────────────────────────────────────────────
@@ -42,7 +49,7 @@ async def safe_delete(key: str):
     except Exception:
         pass
 
-# ── Sync helpers — call_service ────────────────────────────────────────
+# ── Sync helpers ───────────────────────────────────────────────────────
 
 def safe_incr(key: str) -> None:
     try:
