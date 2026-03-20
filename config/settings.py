@@ -46,11 +46,10 @@ INSTALLED_APPS = [
     "adrf",
 
     "api",
-    # "email_service",
+    "email_service",
     "whatsapp_service",
-    # "call_service",
-    # "workers",
-    # "delivery_logs",
+    "workers",
+    "delivery_logs",
     "candidate",
 ]
 
