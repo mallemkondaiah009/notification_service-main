@@ -43,13 +43,14 @@ INSTALLED_APPS = [
     'django.contrib.staticfiles',
 
     'rest_framework',
+    "adrf",
 
     "api",
-    "email_service",
+    # "email_service",
     "whatsapp_service",
-    "call_service",
+    # "call_service",
     # "workers",
-    "delivery_logs",
+    # "delivery_logs",
     "candidate",
 ]
 
@@ -81,15 +82,29 @@ TEMPLATES = [
 ]
 
 WSGI_APPLICATION = 'config.wsgi.application'
+ASGI_APPLICATION = "config.asgi.application"
 
 
 # Database
 # https://docs.djangoproject.com/en/6.0/ref/settings/#databases
 
 DATABASES = {
-    'default': {
-        'ENGINE': 'django.db.backends.sqlite3',
-        'NAME': BASE_DIR / 'db.sqlite3',
+    "default": {
+        "ENGINE":   "django.db.backends.postgresql",
+        "NAME":     os.getenv("DB_NAME"),
+        "USER":     os.getenv("DB_USER"),
+        "PASSWORD": os.getenv("DB_PASSWORD"),
+        "HOST":     os.getenv("DB_HOST", "localhost"),
+        "PORT":     os.getenv("DB_PORT", "5432"),
+        "OPTIONS": {
+            "pool": {
+                "min_size":          5,
+                "max_size":          50,
+                "timeout":           10,
+                "reconnect_timeout": 5,
+                "max_waiting":       100,
+            },
+        },
     }
 }
 
@@ -147,11 +162,23 @@ TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
 TWILIO_WHATSAPP_NUMBER = os.getenv("TWILIO_WHATSAPP_NUMBER")
 TWILIO_PHONE_NUMBER = os.getenv("TWILIO_PHONE_NUMBER")
 
-CELERY_BROKER_URL = os.getenv("CELERY_BROKER_URL")
-CELERY_RESULT_BACKEND = os.getenv("CELERY_RESULT_BACKEND")
-CELERY_ACCEPT_CONTENT = ["json"]
-CELERY_TASK_SERIALIZER = "json"
-CELERY_RESULT_SERIALIZER = "json"
+REDIS_BASE_URL = os.getenv("REDIS_BASE_URL", "redis://localhost:6379")
+
+CELERY_BROKER_URL     = f"{REDIS_BASE_URL}/0"
+CELERY_RESULT_BACKEND = f"{REDIS_BASE_URL}/0"
+REDIS_CONTEXT_URL     = f"{REDIS_BASE_URL}/1"
+REDIS_LOCKS_URL       = f"{REDIS_BASE_URL}/2"
+
+CACHES = {
+    "default": {
+        "BACKEND": "django_redis.cache.RedisCache",
+        "LOCATION": f"{REDIS_BASE_URL}/3",
+        "OPTIONS": {
+            "CLIENT_CLASS": "django_redis.client.DefaultClient",
+            "CONNECTION_POOL_KWARGS": {"max_connections": 50},
+        },
+    }
+}
 
 BASE_URL = os.getenv("BASE_URL")
 
@@ -161,37 +188,74 @@ CSRF_TRUSTED_ORIGINS = [
     "https://armani-suppled-odorously.ngrok-free.dev",
 ]
 
+CELERY_BROKER_CONNECTION_RETRY_ON_STARTUP = True
+CELERY_WORKER_PREFETCH_MULTIPLIER         = 1
+CELERY_TASK_ACKS_LATE                     = True
+CELERY_WORKER_MAX_TASKS_PER_CHILD         = 1000
+CELERY_TASK_SERIALIZER                    = "json"
+CELERY_RESULT_SERIALIZER                  = "json"
+CELERY_ACCEPT_CONTENT                     = ["json"]
+CELERY_TASK_IGNORE_RESULT                 = True
+CELERY_TASK_SOFT_TIME_LIMIT               = 10
+CELERY_TASK_TIME_LIMIT                    = 15
+CELERY_TASK_ROUTES = {
+    "workers.tasks.send_whatsapp_reply_task":         {"queue": "replies"},
+    "workers.tasks.send_whatsapp_notification":       {"queue": "notifications"},
+    "workers.tasks.send_bulk_whatsapp_notifications": {"queue": "bulk"},
+}
+
+# Create logs directory if it doesn't exist
+os.makedirs("logs", exist_ok=True)
 
 LOGGING = {
     "version": 1,
     "disable_existing_loggers": False,
+
     "formatters": {
         "verbose": {
             "format": "[{asctime}] {levelname} {name} — {message}",
             "style": "{",
         },
     },
+
     "handlers": {
         "console": {
-            "class": "logging.StreamHandler",
+            "class":     "logging.StreamHandler",
             "formatter": "verbose",
         },
         "file": {
-            "class": "logging.FileHandler",
-            "filename": "logs/app.log",
-            "formatter": "verbose",
+            "class":      "logging.handlers.RotatingFileHandler",
+            "filename":   "logs/app.log",
+            "maxBytes":   10 * 1024 * 1024,  # 10MB per file
+            "backupCount": 5,                 # keep last 5 files
+            "formatter":  "verbose",
+            "encoding":   "utf-8",
         },
     },
+
     "loggers": {
-        "call_service": {
-            "handlers": ["console", "file"],
-            "level": "INFO",
-            "propagate": False,
-        },
-        "whatsapp_service": {
-            "handlers": ["console", "file"],
-            "level": "INFO",
-            "propagate": False,
-        },
+        # WhatsApp service
+        "whatsapp.views":     {"handlers": ["console", "file"], "level": "INFO", "propagate": False},
+        "whatsapp.services":  {"handlers": ["console", "file"], "level": "INFO", "propagate": False},
+        "whatsapp.ai":        {"handlers": ["console", "file"], "level": "INFO", "propagate": False},
+        "whatsapp.models":    {"handlers": ["console", "file"], "level": "INFO", "propagate": False},
+        "whatsapp.jd_parser": {"handlers": ["console", "file"], "level": "INFO", "propagate": False},
+        "whatsapp.rate_limit":{"handlers": ["console", "file"], "level": "INFO", "propagate": False},
+
+        # Celery tasks
+        "tasks.whatsapp":     {"handlers": ["console", "file"], "level": "INFO", "propagate": False},
+
+        # API
+        "api.views":          {"handlers": ["console", "file"], "level": "INFO", "propagate": False},
+
+        # Call service (sync — future)
+        "call_service":       {"handlers": ["console", "file"], "level": "INFO", "propagate": False},
+
+        # Django internals — errors only
+        "django":             {"handlers": ["console", "file"], "level": "WARNING", "propagate": False},
+        "django.request":     {"handlers": ["console", "file"], "level": "ERROR",   "propagate": False},
     },
 }
+
+
+

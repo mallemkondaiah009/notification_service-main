@@ -1,6 +1,10 @@
-from .menus import send_main_menu
+from whatsapp_service.services import send_text_message
+from whatsapp_service.menu_text import main_menu_text
 
 
-def send_initial_whatsapp(candidate):
+async def send_initial_whatsapp(candidate) -> None:
     """Sends main menu as the first message to candidate."""
-    send_main_menu(candidate)
+    await send_text_message(
+        candidate.phone,
+        main_menu_text(candidate.full_name, candidate.role_name),
+    )

@@ -1,5 +1,12 @@
 import json
+import logging
 import re
+
+from shared.redis_client import redis_context
+
+logger = logging.getLogger("whatsapp.jd_parser")
+
+JD_CACHE_TTL = 60 * 60 * 24 * 7  # 7 days
 
 JD_FIELD_KEYWORDS = {
     "salary_basic": [
@@ -152,107 +159,256 @@ VOICE_TEMPLATES = {
 }
 
 
-def _normalize_speech(text):
-    text = text.lower().strip()
-    fillers = ["um", "uh", "like", "you know", "actually", "basically", "so", "well"]
-    for filler in fillers:
-        text = re.sub(rf"\b{filler}\b", "", text)
-    text = re.sub(r"\s+", " ", text).strip()
-    return text
+# ── Public text cleaners ───────────────────────────────────────────────
+
+def clean_for_whatsapp(text: str) -> str:
+    """
+    Public — used by views.py for live scan fallback.
+    Cleans text for WhatsApp display.
+    Keeps line breaks. Strips bullets, hyphens, markdown.
+    """
+    lines = []
+    for line in text.splitlines():
+        line = line.strip()
+        line = re.sub(r"^[-•*]\s*", "", line)           # strip leading bullets
+        line = re.sub(r"\*{2}(.+?)\*{2}", r"\1", line)  # strip bold **text**
+        line = re.sub(r"\*(.+?)\*", r"\1", line)         # strip italic *text*
+        if line:
+            lines.append(line)
+    return "\n".join(lines)
 
 
-def _clean_for_voice(text):
+def clean_for_voice(text: str) -> str:
+    """
+    Public — used by call_service.
+    Single line, no bullets, no markdown.
+    """
     text = re.sub(r"\*+", "", text)
     text = re.sub(r"_+", "", text)
     text = re.sub(r"#+\s*", "", text)
-    text = re.sub(r"^\s*[-•]\s*", "", text, flags=re.MULTILINE)
+    text = re.sub(r"^\s*[-•*]\s*", "", text, flags=re.MULTILINE)
     text = re.sub(r"\n+", ". ", text)
     text = re.sub(r"\.\s*\.", ".", text)
     text = re.sub(r"\s+", " ", text).strip()
-    return text
+    return text.strip(". ")
 
 
-def extract_answer(button_id, job_description):
-    keywords = JD_FIELD_KEYWORDS.get(button_id, [])
-    label = FRIENDLY_LABELS.get(button_id, button_id.replace("_", " ").title())
+# ── Private helpers ────────────────────────────────────────────────────
+
+def _normalize_speech(text: str) -> str:
+    text = text.lower().strip()
+    for filler in ["um", "uh", "like", "you know", "actually", "basically", "so", "well"]:
+        text = re.sub(rf"\b{filler}\b", "", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _extract_answer_sync(button_id: str, job_description: str) -> tuple[str, str | None]:
+    """
+    Scan JD text and extract relevant lines for a field.
+    Pure Python — no I/O — intentionally sync.
+    """
+    keywords  = JD_FIELD_KEYWORDS.get(button_id, [])
+    label     = FRIENDLY_LABELS.get(button_id, button_id.replace("_", " ").title())
 
     if not keywords:
         return label, None
 
-    lines = job_description.split("\n")
+    lines        = job_description.split("\n")
     result_lines = []
-    capturing = False
+    capturing    = False
 
     for line in lines:
         line_lower = line.lower().strip()
+        line_clean = line.strip()
 
         if any(kw in line_lower for kw in keywords):
             capturing = True
-            result_lines.append(line.strip())
+            if (
+                line_clean.endswith(":")
+                or line_clean.upper() == line_clean
+                or (len(line_clean.split()) <= 5 and line_clean.endswith(":"))
+            ):
+                continue
+            result_lines.append(line_clean)
             continue
 
         if capturing:
-            if line.strip() and (
-                line.strip().endswith(":") or
-                line.strip().isupper() or
-                (len(line.strip()) > 3 and line.strip()[0].isupper() and line.strip().endswith(":"))
+            if line_clean and (
+                line_clean.endswith(":")
+                or line_clean.isupper()
+                or (len(line_clean) > 3 and line_clean[0].isupper() and line_clean.endswith(":"))
             ):
                 break
-            if line.strip():
-                result_lines.append(line.strip())
-            if len(result_lines) >= 5:
+            if line_clean:
+                result_lines.append(line_clean)
+            if len(result_lines) >= 6:
                 break
 
     if result_lines:
         return label, "\n".join(result_lines)
 
+    capturing = False
     for line in lines:
-        if any(kw in line.lower() for kw in keywords):
-            return label, line.strip()
+        line_lower = line.lower().strip()
+        line_clean = line.strip()
+        if any(kw in line_lower for kw in keywords):
+            capturing = True
+            if not line_clean.endswith(":"):
+                return label, line_clean
+            continue
+        if capturing and line_clean and not line_clean.endswith(":"):
+            return label, line_clean
 
     return label, None
 
 
-def match_speech_to_field(speech):
+def _match_speech_to_field_sync(speech: str) -> str | None:
     normalized = _normalize_speech(speech)
-    scores = {}
-    for button_id, keywords in JD_FIELD_KEYWORDS.items():
-        score = sum(1 for kw in keywords if kw in normalized)
-        if score > 0:
-            scores[button_id] = score
-    if not scores:
-        return None
-    return max(scores, key=scores.get)
+    scores = {
+        button_id: sum(1 for kw in keywords if kw in normalized)
+        for button_id, keywords in JD_FIELD_KEYWORDS.items()
+    }
+    scores = {k: v for k, v in scores.items() if v > 0}
+    return max(scores, key=scores.get) if scores else None
 
 
-def cache_jd_answers(candidate_id, job_description, redis_client):
+def _build_answers(job_description: str) -> dict:
+    """Build full answers dict from JD text."""
     answers = {}
     for button_id in JD_FIELD_KEYWORDS:
-        label, answer = extract_answer(button_id, job_description)
+        label, answer = _extract_answer_sync(button_id, job_description)
         if answer:
-            clean = _clean_for_voice(answer)
             template = VOICE_TEMPLATES.get(button_id, "{answer}")
             answers[button_id] = {
-                "label": label,
-                "spoken": template.format(answer=clean),
+                "label":  label,
+                "raw":    clean_for_whatsapp(answer),
+                "spoken": template.format(answer=clean_for_voice(answer)),
             }
-    redis_client.set(
-        f"jd_cache:{candidate_id}",
-        json.dumps(answers),
-        ex=60 * 60 * 24,
-    )
+    return answers
 
 
-def get_cached_answer(candidate_id, speech, redis_client):
+# ── Public sync API — call_service compatibility ───────────────────────
+
+def extract_answer(button_id: str, job_description: str) -> tuple[str, str | None]:
+    return _extract_answer_sync(button_id, job_description)
+
+
+def match_speech_to_field(speech: str) -> str | None:
+    return _match_speech_to_field_sync(speech)
+
+
+# ── Async Redis cache ──────────────────────────────────────────────────
+
+async def cache_jd_answers(jd_id: int, job_description: str) -> None:
+    """
+    Build and cache JD answers by JD ID.
+    Always overwrites — ensures cache is always fresh.
+    Stored once, shared across all candidates with same JD.
+    TTL: 7 days.
+    """
+    cache_key = f"jd_answers:{jd_id}"
+
     try:
-        cached = redis_client.get(f"jd_cache:{candidate_id}")
+        answers = _build_answers(job_description)
+
+        if not answers:
+            logger.warning("[JD_PARSER] No answers extracted — jd_id=%d", jd_id)
+            return
+
+        await redis_context.set(
+            cache_key,
+            json.dumps(answers),
+            ex=JD_CACHE_TTL,
+        )
+        logger.info(
+            "[JD_PARSER] Cached %d fields — jd_id=%d",
+            len(answers), jd_id,
+        )
+
+    except Exception as exc:
+        logger.error(
+            "[JD_PARSER] cache_jd_answers failed — jd_id=%d error=%s",
+            jd_id, exc,
+        )
+
+
+async def get_cached_answer(
+    jd_id: int,
+    field: str,
+) -> tuple[str | None, str | None]:
+    """
+    Get WhatsApp-ready answer from cache by JD ID and field.
+    Returns (label, raw_clean_text) or (None, None) on miss.
+    """
+    try:
+        cached = await redis_context.get(f"jd_answers:{jd_id}")
         if not cached:
             return None, None
+
         answers = json.loads(cached)
-        button_id = match_speech_to_field(speech)
-        if not button_id or button_id not in answers:
+        entry   = answers.get(field)
+
+        if not entry:
             return None, None
-        entry = answers[button_id]
-        return entry["label"], entry["spoken"]
-    except Exception:
+
+        return entry["label"], entry["raw"]
+
+    except Exception as exc:
+        logger.error(
+            "[JD_PARSER] get_cached_answer failed — jd_id=%d field=%s error=%s",
+            jd_id, field, exc,
+        )
         return None, None
+
+
+async def get_cached_answer_by_speech(
+    jd_id: int,
+    speech: str,
+) -> tuple[str | None, str | None]:
+    """
+    Get voice-ready answer from cache by JD ID and natural speech.
+    Used by call_service. Returns (label, spoken_text).
+    """
+    try:
+        cached = await redis_context.get(f"jd_answers:{jd_id}")
+        if not cached:
+            return None, None
+
+        answers   = json.loads(cached)
+        button_id = _match_speech_to_field_sync(speech)
+
+        if not button_id:
+            return None, None
+
+        entry = answers.get(button_id)
+        if not entry:
+            return None, None
+
+        return entry["label"], entry["spoken"]
+
+    except Exception as exc:
+        logger.error(
+            "[JD_PARSER] get_cached_answer_by_speech failed — jd_id=%d error=%s",
+            jd_id, exc,
+        )
+        return None, None
+
+
+async def invalidate_jd_cache(jd_id: int) -> None:
+    """Delete cached answers — call when JD content is updated."""
+    try:
+        await redis_context.delete(f"jd_answers:{jd_id}")
+        logger.info("[JD_PARSER] Cache invalidated — jd_id=%d", jd_id)
+    except Exception as exc:
+        logger.error(
+            "[JD_PARSER] invalidate_jd_cache failed — jd_id=%d error=%s",
+            jd_id, exc,
+        )
+
+
+async def is_jd_cached(jd_id: int) -> bool:
+    """Check if JD answers are cached — useful for debugging."""
+    try:
+        return await redis_context.exists(f"jd_answers:{jd_id}") == 1
+    except Exception:
+        return False

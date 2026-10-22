@@ -1,7 +1,11 @@
-from .services import send_text_message
+"""
+Pure string constants and helpers for WhatsApp menu messages.
+No imports from views, tasks, or services — zero circular risk.
+"""
 
 
-MAIN_MENU_TEMPLATE = """👋 Hello {name}!
+def main_menu_text(name: str, role: str) -> str:
+    return f"""👋 Hello {name}!
 
 We are hiring for *{role}*.
 
@@ -20,7 +24,8 @@ Please reply with a number to know more:
 
 💬 Or type any question and we'll answer it!"""
 
-SALARY_MENU_TEMPLATE = """💰 *Salary Details*
+
+SALARY_MENU = """💰 *Salary Details*
 
 Reply with a number:
 
@@ -31,7 +36,7 @@ Reply with a number:
 
 0️⃣  Back to Main Menu"""
 
-RESPONSIBILITIES_MENU_TEMPLATE = """📋 *Responsibilities*
+RESPONSIBILITIES_MENU = """📋 *Responsibilities*
 
 Reply with a number:
 
@@ -42,7 +47,7 @@ Reply with a number:
 
 0️⃣  Back to Main Menu"""
 
-LOCATION_MENU_TEMPLATE = """📍 *Work Location*
+LOCATION_MENU = """📍 *Work Location*
 
 Reply with a number:
 
@@ -52,7 +57,7 @@ Reply with a number:
 
 0️⃣  Back to Main Menu"""
 
-NOTICE_MENU_TEMPLATE = """📅 *Notice Period*
+NOTICE_MENU = """📅 *Notice Period*
 
 Reply with a number:
 
@@ -62,7 +67,7 @@ Reply with a number:
 
 0️⃣  Back to Main Menu"""
 
-BENEFITS_MENU_TEMPLATE = """🎁 *Benefits & Perks*
+BENEFITS_MENU = """🎁 *Benefits & Perks*
 
 Reply with a number:
 
@@ -81,40 +86,3 @@ Are you interested in this position?
 ✅ Reply *YES* — I'm Interested
 ❌ Reply *NO* — Not Interested
 0️⃣ Reply *0* — Back to Main Menu"""
-
-
-def send_main_menu(candidate):
-    send_text_message(
-        candidate.phone,
-        MAIN_MENU_TEMPLATE.format(
-            name=candidate.full_name,
-            role=candidate.role_name,
-        ),
-    )
-
-
-def send_salary_menu(candidate):
-    send_text_message(candidate.phone, SALARY_MENU_TEMPLATE)
-
-
-def send_responsibilities_menu(candidate):
-    send_text_message(candidate.phone, RESPONSIBILITIES_MENU_TEMPLATE)
-
-
-def send_location_menu(candidate):
-    send_text_message(candidate.phone, LOCATION_MENU_TEMPLATE)
-
-
-def send_notice_period_menu(candidate):
-    send_text_message(candidate.phone, NOTICE_MENU_TEMPLATE)
-
-
-def send_benefits_menu(candidate):
-    send_text_message(candidate.phone, BENEFITS_MENU_TEMPLATE)
-
-
-def send_interest_buttons(candidate, answer):
-    send_text_message(
-        candidate.phone,
-        INTEREST_PROMPT.format(answer=answer),
-    )

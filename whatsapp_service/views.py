@@ -1,188 +1,308 @@
-from django.utils import timezone
-from rest_framework.decorators import api_view
+import asyncio
+import logging
+
+from django.utils.decorators import method_decorator
+from django.views.decorators.csrf import csrf_exempt
+from adrf.views import APIView
+from rest_framework.request import Request
 from rest_framework.response import Response
 
 from candidate.models import Candidate, ConversationLog
-from delivery_logs.models import DeliveryLog
-from workers.tasks import send_whatsapp_reply_message
-from .ai import get_ai_whatsapp_response
-from .menus import (
-    send_main_menu,
-    send_salary_menu,
-    send_responsibilities_menu,
-    send_location_menu,
-    send_notice_period_menu,
-    send_benefits_menu,
-    send_interest_buttons,
+from shared.jd_parser import (
+    extract_answer,
+    get_cached_answer,
+    FRIENDLY_LABELS,
+    clean_for_whatsapp,
 )
-from shared.jd_parser import extract_answer, FRIENDLY_LABELS
-from .quick_replies import resolve_intent, get_context, set_context, clear_context
+
+from .ai import get_ai_whatsapp_response
+from .menu_text import (
+    main_menu_text,
+    SALARY_MENU,
+    RESPONSIBILITIES_MENU,
+    LOCATION_MENU,
+    NOTICE_MENU,
+    BENEFITS_MENU,
+)
+from .quick_replies import (
+    resolve_intent, get_context, set_context, clear_context,
+    JD_FIELDS, JD_QUESTION_INTENTS,
+)
+
+logger = logging.getLogger("whatsapp.views")
+
+# ── Cached task reference — imported once, reused forever ─────────────
+_reply_task = None
+
+def _get_reply_task():
+    global _reply_task
+    if _reply_task is None:
+        from workers.tasks import send_whatsapp_reply_task
+        _reply_task = send_whatsapp_reply_task
+    return _reply_task
 
 
-def _log_delivery(candidate, message, status):
-    DeliveryLog.objects.create(
-        candidate=candidate,
-        channel="whatsapp",
-        recipient=candidate.phone,
-        message=message,
-        status=status,
-    )
+# ── Internal helpers ───────────────────────────────────────────────────
 
+async def _log(
+    candidate,
+    direction: str,
+    sender: str,
+    message: str,
+    status: str | None = None,
+) -> None:
+    if direction == "outbound" and status == "unclear":
+        if candidate.status in ("interested", "not_interested"):
+            status = candidate.status
 
-def _save_response(candidate, status):
-    candidate.status = status
-    candidate.responded_via = "whatsapp"
-    candidate.responded_at = timezone.now()
-    candidate.save()
-
-
-def _log_conversation(candidate, direction, sender, message, ai_detected_status=None):
-    ConversationLog.objects.create(
+    await ConversationLog.alog(
         candidate=candidate,
         channel="whatsapp",
         direction=direction,
         sender=sender,
         message=message,
-        ai_detected_status=ai_detected_status,
+        ai_detected_status=status,
     )
 
 
-def _serve_jd_answer(candidate, field: str):
-    """Tier 2 — extract answer from JD and send with interest buttons."""
-    label, answer = extract_answer(field, candidate.job_description)
+async def _warm_jd_cache(jd_id: int, job_content: str) -> None:
+    """
+    Background cache warm — fire and forget.
+    Never blocks the reply path.
+    """
+    from shared.jd_parser import cache_jd_answers
+    try:
+        await cache_jd_answers(jd_id, job_content)
+        logger.info("[VIEWS] Cache warmed — jd_id=%d", jd_id)
+    except Exception as exc:
+        logger.error("[VIEWS] Cache warm failed — jd_id=%d error=%s", jd_id, exc)
+
+
+async def _serve_jd_answer(candidate, field: str) -> None:
+    """
+    Serve JD answer.
+    Cache hit  → instant reply
+    Cache miss → live scan + background cache warm (non-blocking)
+    """
+    label, answer = await get_cached_answer(candidate.job.id, field)
+
+    if not answer:
+        logger.info(
+            "[VIEWS] Cache miss — jd_id=%d field=%s — live scan",
+            candidate.job.id, field,
+        )
+        label, answer = extract_answer(field, candidate.job.content)
+        if answer:
+            answer = clean_for_whatsapp(answer)
+
+        # Warm cache in background — does not block reply
+        asyncio.ensure_future(_warm_jd_cache(candidate.job.id, candidate.job.content))
+
     if answer:
-        context_msg = f"*{label}*\n\n{answer}"
+        msg = f"*{label}*\n\n{answer}"
     else:
         label = FRIENDLY_LABELS.get(field, field.replace("_", " ").title())
-        context_msg = (
+        msg = (
             f"We don't have specific details about *{label}* right now.\n\n"
             f"Feel free to type your question and our team will get back to you!"
         )
-    _log_delivery(candidate, f"JD answer served: {label}", "success")
-    _log_conversation(candidate, "outbound", "system", context_msg)
-    send_interest_buttons(candidate, context_msg)
+
+    # Run log and task dispatch concurrently
+    await _log(candidate, "outbound", "system", msg)
+    _get_reply_task().delay(candidate.id, msg)
 
 
-@api_view(["POST"])
-def whatsapp_webhook(request):
-    phone = request.data.get("From", "").replace("whatsapp:", "")
-    message = request.data.get("Body", "").strip()
+async def _handle_ai_fallback(candidate, message: str) -> None:
+    history = await ConversationLog.aget_recent(candidate, limit=5)
 
-    try:
-        candidate = Candidate.objects.get(phone=phone)
-    except Candidate.DoesNotExist:
-        return Response({"status": "candidate not found"})
+    ai_reply, detected = await get_ai_whatsapp_response(
+        candidate_message=message,
+        candidate_name=candidate.full_name,
+        role_name=candidate.role_name,
+        job_description=candidate.job.content,
+        candidate_status=candidate.status,
+        history=history,
+    )
 
-    if not message:
-        return Response({"status": "empty message"})
+    if candidate.status not in ("interested", "not_interested"):
+        if detected == "interested":
+            await asyncio.gather(
+                candidate.amark_response("interested", "whatsapp"),
+                clear_context(candidate.id),
+            )
+        elif detected == "not_interested":
+            await asyncio.gather(
+                candidate.amark_response("not_interested", "whatsapp"),
+                clear_context(candidate.id),
+            )
 
-    _log_conversation(candidate, "inbound", "candidate", message)
+    await _log(candidate, "outbound", "ai", ai_reply, detected)
+    _get_reply_task().delay(candidate.id, ai_reply)
 
-    intent = resolve_intent(candidate.id, message)
 
-    # ── Unrecognized input inside a sub-menu → back to main menu ─────
-    if intent is None:
-        current_context = get_context(candidate.id)
-        if current_context != "main":
-            clear_context(candidate.id)
-            _log_conversation(candidate, "outbound", "system", "[Unrecognized in sub-menu → Main Menu]")
-            send_main_menu(candidate)
+# ── View ───────────────────────────────────────────────────────────────
+
+@method_decorator(csrf_exempt, name="dispatch")
+class WhatsAppWebhookView(APIView):
+
+    async def post(self, request: Request) -> Response:
+        phone   = request.data.get("From", "").replace("whatsapp:", "").strip()
+        message = request.data.get("Body", "").strip()
+
+        if not phone or not message:
+            return Response({"status": "bad request"}, status=400)
+
+        candidate = await Candidate.aget_by_phone_or_none(phone)
+        if candidate is None:
+            logger.warning("[WEBHOOK] Unknown phone — %s", phone)
+            return Response({"status": "candidate not found"}, status=404)
+
+        await _log(candidate, "inbound", "candidate", message)
+
+        intent = await resolve_intent(candidate.id, message)
+
+        # ── Already decided flow ───────────────────────────────────────
+        if candidate.status in ("interested", "not_interested"):
+
+            if intent in JD_QUESTION_INTENTS or (intent and intent.startswith("jd_")):
+                pass
+
+            elif intent is None:
+                ctx = await get_context(candidate.id)
+                if ctx != "main":
+                    await clear_context(candidate.id)
+                    _get_reply_task().delay(
+                        candidate.id,
+                        main_menu_text(candidate.full_name, candidate.role_name),
+                    )
+                else:
+                    await _handle_ai_fallback(candidate, message)
+                return Response({"status": "received"})
+
+            elif intent == "interested" and candidate.status == "interested":
+                reply = (
+                    f"Hi {candidate.full_name}! 😊\n\n"
+                    f"You have already confirmed your interest in the "
+                    f"*{candidate.role_name}* position.\n\n"
+                    f"Our recruitment team will reach out to you very soon. "
+                    f"Feel free to ask any questions about the role!"
+                )
+                await _log(candidate, "outbound", "system", reply, "interested")
+                _get_reply_task().delay(candidate.id, reply)
+                return Response({"status": "received"})
+
+            elif intent == "interested" and candidate.status == "not_interested":
+                reply = (
+                    f"Wonderful! We are glad you changed your mind, {candidate.full_name}! 😊\n\n"
+                    f"Our recruitment team will reach out to you very soon "
+                    f"with the next steps.\n\nHave a great day!"
+                )
+                await asyncio.gather(
+                    candidate.amark_response("interested", "whatsapp"),
+                    clear_context(candidate.id),
+                    _log(candidate, "outbound", "system", reply, "interested"),
+                )
+                _get_reply_task().delay(candidate.id, reply)
+                return Response({"status": "received"})
+
+            elif intent == "not_interested" and candidate.status == "interested":
+                reply = (
+                    f"Thank you for letting us know, {candidate.full_name}.\n\n"
+                    f"We will keep your profile on file for future opportunities.\n\n"
+                    f"All the best! 👍"
+                )
+                await asyncio.gather(
+                    candidate.amark_response("not_interested", "whatsapp"),
+                    clear_context(candidate.id),
+                    _log(candidate, "outbound", "system", reply, "not_interested"),
+                )
+                _get_reply_task().delay(candidate.id, reply)
+                return Response({"status": "received"})
+
+            elif intent == "not_interested" and candidate.status == "not_interested":
+                reply = (
+                    f"Hi {candidate.full_name},\n\n"
+                    f"You had previously indicated you are not interested.\n\n"
+                    f"If you change your mind anytime, reply *YES* and we would "
+                    f"love to have you on board! 😊"
+                )
+                await _log(candidate, "outbound", "system", reply, "not_interested")
+                _get_reply_task().delay(candidate.id, reply)
+                return Response({"status": "received"})
+
+        # ── Main flow ──────────────────────────────────────────────────
+
+        if intent is None:
+            ctx = await get_context(candidate.id)
+            if ctx != "main":
+                await clear_context(candidate.id)
+                _get_reply_task().delay(
+                    candidate.id,
+                    main_menu_text(candidate.full_name, candidate.role_name),
+                )
+            else:
+                await _handle_ai_fallback(candidate, message)
             return Response({"status": "received"})
 
-    # ── TIER 1: INTERESTED ────────────────────────────────────────────
-    if intent == "interested":
-        _save_response(candidate, "interested")
-        clear_context(candidate.id)
-        _log_delivery(candidate, "Candidate replied YES → Interested", "success")
-        reply = (
-            f"Thank you for your interest, {candidate.full_name}! 😊\n\n"
-            f"Our recruitment team will reach out to you very soon "
-            f"with the next steps.\n\nHave a great day!"
-        )
-        _log_conversation(candidate, "outbound", "system", reply, "interested")
-        send_whatsapp_reply_message.delay(candidate.id, reply)
+        if intent == "interested":
+            reply = (
+                f"Thank you for your interest, {candidate.full_name}! 😊\n\n"
+                f"Our recruitment team will reach out to you very soon "
+                f"with the next steps.\n\nHave a great day!"
+            )
+            await asyncio.gather(
+                candidate.amark_response("interested", "whatsapp"),
+                clear_context(candidate.id),
+                _log(candidate, "outbound", "system", reply, "interested"),
+            )
+            _get_reply_task().delay(candidate.id, reply)
 
-    # ── TIER 1: NOT INTERESTED ────────────────────────────────────────
-    elif intent == "not_interested":
-        _save_response(candidate, "not_interested")
-        clear_context(candidate.id)
-        _log_delivery(candidate, "Candidate replied NO → Not Interested", "success")
-        reply = (
-            f"Thank you for letting us know, {candidate.full_name}.\n\n"
-            f"We will keep your profile on file for future opportunities.\n\n"
-            f"All the best! 👍"
-        )
-        _log_conversation(candidate, "outbound", "system", reply, "not_interested")
-        send_whatsapp_reply_message.delay(candidate.id, reply)
+        elif intent == "not_interested":
+            reply = (
+                f"Thank you for letting us know, {candidate.full_name}.\n\n"
+                f"We will keep your profile on file for future opportunities.\n\n"
+                f"All the best! 👍"
+            )
+            await asyncio.gather(
+                candidate.amark_response("not_interested", "whatsapp"),
+                clear_context(candidate.id),
+                _log(candidate, "outbound", "system", reply, "not_interested"),
+            )
+            _get_reply_task().delay(candidate.id, reply)
 
-    # ── TIER 1: BACK TO MAIN MENU ─────────────────────────────────────
-    elif intent == "back_main":
-        clear_context(candidate.id)
-        _log_conversation(candidate, "outbound", "system", "[Main Menu Sent]")
-        send_main_menu(candidate)
+        elif intent == "back_main":
+            await clear_context(candidate.id)
+            _get_reply_task().delay(
+                candidate.id,
+                main_menu_text(candidate.full_name, candidate.role_name),
+            )
 
-    # ── MENU NAVIGATION ───────────────────────────────────────────────
-    elif intent == "menu_salary":
-        set_context(candidate.id, "salary")
-        _log_conversation(candidate, "outbound", "system", "[Salary Sub-Menu Sent]")
-        send_salary_menu(candidate)
+        elif intent == "menu_salary":
+            await asyncio.gather(
+                set_context(candidate.id, "salary"),
+            )
+            _get_reply_task().delay(candidate.id, SALARY_MENU)
 
-    elif intent == "menu_responsibilities":
-        set_context(candidate.id, "responsibilities")
-        _log_conversation(candidate, "outbound", "system", "[Responsibilities Sub-Menu Sent]")
-        send_responsibilities_menu(candidate)
+        elif intent == "menu_responsibilities":
+            await set_context(candidate.id, "responsibilities")
+            _get_reply_task().delay(candidate.id, RESPONSIBILITIES_MENU)
 
-    elif intent == "menu_location":
-        set_context(candidate.id, "location")
-        _log_conversation(candidate, "outbound", "system", "[Location Sub-Menu Sent]")
-        send_location_menu(candidate)
+        elif intent == "menu_location":
+            await set_context(candidate.id, "location")
+            _get_reply_task().delay(candidate.id, LOCATION_MENU)
 
-    elif intent == "menu_notice_period":
-        set_context(candidate.id, "notice_period")
-        _log_conversation(candidate, "outbound", "system", "[Notice Period Sub-Menu Sent]")
-        send_notice_period_menu(candidate)
+        elif intent == "menu_notice_period":
+            await set_context(candidate.id, "notice_period")
+            _get_reply_task().delay(candidate.id, NOTICE_MENU)
 
-    elif intent == "menu_benefits":
-        set_context(candidate.id, "benefits")
-        _log_conversation(candidate, "outbound", "system", "[Benefits Sub-Menu Sent]")
-        send_benefits_menu(candidate)
+        elif intent == "menu_benefits":
+            await set_context(candidate.id, "benefits")
+            _get_reply_task().delay(candidate.id, BENEFITS_MENU)
 
-    # ── TIER 2: DIRECT JD ANSWER (natural language topic match) ──────
-    elif intent and intent.startswith("jd_"):
-        field = intent[3:]  # strip "jd_" prefix → e.g. "salary_basic"
-        _serve_jd_answer(candidate, field)
+        elif intent.startswith("jd_"):
+            await _serve_jd_answer(candidate, intent[3:])
 
-    # ── NUMBERED SUB-MENU ITEMS → extract from JD ────────────────────
-    elif intent in (
-        "salary_basic", "salary_ctc", "salary_variables", "salary_increment",
-        "resp_daily", "resp_skills", "resp_team", "resp_growth",
-        "loc_city", "loc_remote", "loc_travel",
-        "notice_duration", "notice_buyout", "notice_immediate",
-        "ben_insurance", "ben_leaves", "ben_food", "ben_other",
-    ):
-        _serve_jd_answer(candidate, intent)
+        elif intent in JD_FIELDS:
+            await _serve_jd_answer(candidate, intent)
 
-    # ── TIER 3: AI FALLBACK ───────────────────────────────────────────
-    else:
-        ai_response, detected_status = get_ai_whatsapp_response(
-            candidate_message=message,
-            candidate_name=candidate.full_name,
-            role_name=candidate.role_name,
-            job_description=candidate.job_description,
-        )
-
-        if detected_status == "interested":
-            _save_response(candidate, "interested")
-            clear_context(candidate.id)
-            _log_delivery(candidate, "AI detected: Interested", "success")
-        elif detected_status == "not_interested":
-            _save_response(candidate, "not_interested")
-            clear_context(candidate.id)
-            _log_delivery(candidate, "AI detected: Not Interested", "success")
-        else:
-            _log_delivery(candidate, "AI detected: Unclear", "failed")
-
-        _log_conversation(candidate, "outbound", "ai", ai_response, detected_status)
-        send_whatsapp_reply_message.delay(candidate.id, ai_response)
-
-    return Response({"status": "received"})
+        return Response({"status": "received"})
